@@ -25,42 +25,49 @@ jobs:
           import urllib.request
           import struct
           import hashlib
-          import sys
 
           REPO = "burner22/numbat"
           TARGET = "model.layers.10.mlp.experts.100.gate_proj.weight"
-          API = f"https://huggingface.co/api/models/{REPO}/resolve/main"
+
+          BASE = f"https://huggingface.co/{REPO}/resolve/main"
+          API = f"https://huggingface.co/api/models/{REPO}"
           MAX_BYTES = 64 * 1024 * 1024
+
+          def get(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Numbat-Runner/2.1"}
+              )
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  return response.read()
 
           def request_range(url, start, end):
               req = urllib.request.Request(
                   url,
                   headers={
                       "Range": f"bytes={start}-{end}",
-                      "User-Agent": "Numbat-Runner/2.0"
+                      "User-Agent": "Numbat-Runner/2.1"
                   }
               )
 
-              response = urllib.request.urlopen(req, timeout=120)
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  if response.status != 206:
+                      raise RuntimeError(
+                          f"Expected HTTP 206, got {response.status}"
+                      )
 
-              if response.status != 206:
-                  status = response.status
-                  response.close()
-                  raise RuntimeError(
-                      f"Server did not honor Range request: HTTP {status}"
+                  content_range = response.headers.get(
+                      "Content-Range", ""
                   )
 
-              content_range = response.headers.get("Content-Range", "")
-              expected = f"bytes {start}-{end}/"
+                  if not content_range.startswith(
+                      f"bytes {start}-{end}/"
+                  ):
+                      raise RuntimeError(
+                          f"Unexpected Content-Range: {content_range}"
+                      )
 
-              if not content_range.startswith(expected):
-                  response.close()
-                  raise RuntimeError(
-                      f"Unexpected Content-Range: {content_range}"
-                  )
-
-              data = response.read()
-              response.close()
+                  data = response.read()
 
               if len(data) != end - start + 1:
                   raise RuntimeError("Incomplete range response")
@@ -71,10 +78,10 @@ jobs:
           print("NUMBAT SELECTIVE TENSOR DOWNLOAD")
           print("=" * 60)
 
-          index_url = f"{API}/model.safetensors.index.json"
+          print("\nSTEP 1: Download tensor index")
 
-          with urllib.request.urlopen(index_url, timeout=60) as response:
-              index = json.loads(response.read())
+          index_url = f"{BASE}/model.safetensors.index.json"
+          index = json.loads(get(index_url))
 
           weight_map = index["weight_map"]
 
@@ -82,12 +89,13 @@ jobs:
               raise RuntimeError(f"Tensor not found: {TARGET}")
 
           shard = weight_map[TARGET]
-          url = f"{API}/{shard}"
+          url = f"{BASE}/{shard}"
 
-          print(f"\nTensor: {TARGET}")
+          print(f"Index loaded: {len(weight_map):,} tensors")
+          print(f"Target: {TARGET}")
           print(f"Shard: {shard}")
 
-          print("\nSTEP 1: Read Safetensors header")
+          print("\nSTEP 2: Read Safetensors header")
 
           first_bytes = request_range(url, 0, 7)
           header_size = struct.unpack("<Q", first_bytes)[0]
@@ -116,26 +124,22 @@ jobs:
           print(f"Tensor size: {tensor_size:,} bytes")
 
           if tensor_size <= 0 or tensor_size > MAX_BYTES:
-              raise RuntimeError(
-                  f"Tensor exceeds safety limit of {MAX_BYTES:,} bytes"
-              )
+              raise RuntimeError("Tensor exceeds safety limit")
 
-          print("\nSTEP 2: Download only the tensor data")
+          print("\nSTEP 3: Download only selected tensor")
 
           tensor_data = request_range(url, data_start, data_end)
-
           digest = hashlib.sha256(tensor_data).hexdigest()
 
-          with open("/tmp/numbat_selected_tensor.bin", "wb") as file:
-              file.write(tensor_data)
+          with open("/tmp/numbat_selected_tensor.bin", "wb") as f:
+              f.write(tensor_data)
 
           print(f"Downloaded: {len(tensor_data):,} bytes")
           print(f"SHA256: {digest}")
 
-          print("\nSTEP 3: Verify")
+          print("\nSTEP 4: Verify")
 
-          if len(tensor_data) != tensor_size:
-              raise RuntimeError("Tensor size verification failed")
+          assert len(tensor_data) == tensor_size
 
           print("HTTP Range: PASS")
           print("Tensor metadata: PASS")
