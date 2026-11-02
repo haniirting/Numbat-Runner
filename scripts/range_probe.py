@@ -6,9 +6,14 @@ from urllib.parse import quote
 
 REPO = "burner22/numbat"
 SHARD = "model-00060-of-00772.safetensors"
-BASE = f"https://huggingface.co/{REPO}/resolve/main/{quote(SHARD)}"
+
+BASE = (
+    f"https://huggingface.co/{REPO}/resolve/main/"
+    f"{quote(SHARD)}"
+)
 
 MAX_HEADER = 64 * 1024 * 1024
+MIN_TENSOR = 1024
 MAX_TENSOR = 1024 * 1024
 
 
@@ -36,13 +41,16 @@ def get_range(start, end):
 
     if not content_range.startswith(f"bytes {start}-{end}/"):
         response.close()
-        raise RuntimeError(f"Unexpected Content-Range: {content_range}")
+        raise RuntimeError(
+            f"Unexpected Content-Range: {content_range}"
+        )
 
     data = bytearray()
 
     try:
         for chunk in response.iter_content(65536):
             data.extend(chunk)
+
             if len(data) > expected:
                 raise RuntimeError("Server returned too much data")
     finally:
@@ -50,7 +58,7 @@ def get_range(start, end):
 
     if len(data) != expected:
         raise RuntimeError(
-            f"Incomplete range: expected {expected}, got {len(data)}"
+            f"Incomplete range: {len(data)} / {expected}"
         )
 
     return bytes(data)
@@ -61,18 +69,26 @@ def main():
     print("=" * 50)
     print("Shard:", SHARD)
 
-    # Safetensors: first 8 bytes contain header length.
+    # 1. Читаем длину заголовка Safetensors
     first = get_range(0, 7)
     header_size = struct.unpack("<Q", first)[0]
 
-    if header_size <= 0 or header_size > MAX_HEADER:
-        raise RuntimeError(f"Invalid header size: {header_size}")
+    if not 0 < header_size <= MAX_HEADER:
+        raise RuntimeError(
+            f"Invalid header size: {header_size}"
+        )
 
-    print("Header size:", header_size, "bytes")
+    print("Header size:", header_size)
 
-    header_bytes = get_range(8, 8 + header_size - 1)
+    # 2. Загружаем только заголовок
+    header_bytes = get_range(
+        8,
+        8 + header_size - 1
+    )
+
     header = json.loads(header_bytes.decode("utf-8"))
 
+    # 3. Ищем настоящий небольшой тензор
     tensors = []
 
     for name, info in header.items():
@@ -82,32 +98,45 @@ def main():
         start, end = info["data_offsets"]
         size = end - start
 
-        if 0 < size <= MAX_TENSOR:
+        if (
+            MIN_TENSOR <= size <= MAX_TENSOR
+            and info.get("shape")
+        ):
             tensors.append((size, name, info))
 
     print("Tensors in shard:", len(header) - 1)
+    print("Suitable tensors:", len(tensors))
 
     if not tensors:
-        print("No tensor smaller than 1 MiB found.")
-        print("Header inspection successful.")
+        print("No suitable tensor found.")
         return
 
-    size, name, info = min(tensors, key=lambda item: item[0])
+    # Берём самый маленький подходящий тензор
+    size, name, info = min(
+        tensors,
+        key=lambda item: item[0]
+    )
 
     print("\nSelected tensor:", name)
     print("Dtype:", info["dtype"])
     print("Shape:", info["shape"])
-    print("Tensor size:", size, "bytes")
+    print("Size:", size, "bytes")
 
-    data_start = 8 + header_size + info["data_offsets"][0]
+    # 4. Вычисляем абсолютные смещения
+    data_start = (
+        8
+        + header_size
+        + info["data_offsets"][0]
+    )
+
     data_end = data_start + size - 1
 
-    # Read only this tensor, not the complete shard.
+    # 5. Загружаем только данные этого тензора
     tensor_data = get_range(data_start, data_end)
 
-    print("\nDownloaded tensor bytes:", len(tensor_data))
-    print("Full shard was NOT downloaded.")
-    print("Tensor data remained in memory.")
+    print("\nDownloaded bytes:", len(tensor_data))
+    print("Full shard downloaded: NO")
+    print("Tensor stored temporarily in RAM.")
     print("RANGE PROBE SUCCESS")
 
 
