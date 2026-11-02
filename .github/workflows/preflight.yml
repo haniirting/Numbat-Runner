@@ -1,0 +1,30 @@
+
+name: Numbat Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/preflight.py"
+      - ".github/workflows/preflight.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Check environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download project files
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run preflight
+        run: python scripts/preflight.py
