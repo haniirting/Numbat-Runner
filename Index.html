@@ -2,271 +2,452 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#080b12">
-  <title>Numbat Runner</title>
-  <style>
-    * { box-sizing: border-box; }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#080b12">
+<title>Numbat Runner</title>
 
-    body {
-      margin: 0;
-      background: #080b12;
-      color: #edf2ff;
-      font-family: Inter, Arial, sans-serif;
-    }
+<style>
+* {
+  box-sizing: border-box;
+}
 
-    .container {
-      max-width: 1100px;
-      margin: auto;
-      padding: 32px 20px;
-    }
+body {
+  margin: 0;
+  background: #080b12;
+  color: #edf2ff;
+  font-family: Arial, sans-serif;
+}
 
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 15px;
-      border-bottom: 1px solid #20283a;
-      padding-bottom: 22px;
-    }
+.container {
+  max-width: 1100px;
+  margin: auto;
+  padding: 25px 18px;
+}
 
-    .logo {
-      font-size: 22px;
-      font-weight: 800;
-      letter-spacing: -1px;
-    }
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #20283a;
+  padding-bottom: 20px;
+  gap: 12px;
+}
 
-    .logo span { color: #8b7cff; }
+.logo {
+  font-size: 22px;
+  font-weight: bold;
+}
 
-    .status {
-      color: #ffc66d;
-      background: #332817;
-      border: 1px solid #604820;
-      padding: 8px 12px;
-      border-radius: 30px;
-      font-size: 12px;
-    }
+.logo span {
+  color: #9282ff;
+}
 
-    .hero { padding: 65px 0 35px; }
+.status {
+  background: #332817;
+  color: #ffc66d;
+  padding: 8px 12px;
+  border-radius: 30px;
+  font-size: 12px;
+}
 
-    .tag {
-      color: #a99cff;
-      font-size: 12px;
-      letter-spacing: 2px;
-      text-transform: uppercase;
-    }
+.hero {
+  padding: 55px 0 25px;
+}
 
-    h1 {
-      font-size: clamp(38px, 7vw, 68px);
-      letter-spacing: -3px;
-      margin: 15px 0;
-    }
+.tag {
+  color: #a99cff;
+  font-size: 12px;
+  letter-spacing: 2px;
+}
 
-    h1 span {
-      background: linear-gradient(90deg, #9a8cff, #5dd9ff);
-      -webkit-background-clip: text;
-      color: transparent;
-    }
+h1 {
+  font-size: clamp(38px, 7vw, 65px);
+  letter-spacing: -2px;
+  margin: 15px 0;
+}
 
-    .description {
-      color: #929db3;
-      max-width: 620px;
-      line-height: 1.7;
-    }
+h1 span {
+  background: linear-gradient(90deg,#9a8cff,#5dd9ff);
+  -webkit-background-clip: text;
+  color: transparent;
+}
 
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin: 30px 0;
-    }
+.description,
+.muted {
+  color: #929db3;
+  line-height: 1.6;
+}
 
-    .card {
-      background: #101624;
-      border: 1px solid #242e43;
-      border-radius: 16px;
-      padding: 22px;
-    }
+.section-title {
+  font-size: 20px;
+  margin: 35px 0 15px;
+}
 
-    .card small {
-      color: #8490a8;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit,minmax(210px,1fr));
+  gap: 15px;
+}
 
-    .value {
-      font-size: 22px;
-      font-weight: 700;
-      margin-top: 13px;
-    }
+.card {
+  background: #101624;
+  border: 1px solid #242e43;
+  border-radius: 15px;
+  padding: 20px;
+}
 
-    .muted {
-      color: #8490a8;
-      font-size: 13px;
-      margin-top: 8px;
-    }
+.card small {
+  color: #8490a8;
+}
 
-    .section-title {
-      font-size: 19px;
-      margin: 35px 0 15px;
-    }
+.value {
+  font-size: 21px;
+  font-weight: bold;
+  margin: 12px 0 5px;
+}
 
-    .warning {
-      border: 1px solid #694d28;
-      background: #211b12;
-      border-radius: 14px;
-      padding: 18px;
-      color: #eacb96;
-      line-height: 1.6;
-      margin: 22px 0;
-    }
+.warning {
+  margin-top: 20px;
+  padding: 18px;
+  background: #211b12;
+  border: 1px solid #694d28;
+  border-radius: 12px;
+  color: #eacb96;
+  line-height: 1.6;
+}
 
-    .buttons {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-top: 25px;
-    }
+/* CHAT */
 
-    .button {
-      display: inline-block;
-      text-decoration: none;
-      color: white;
-      background: #7665ed;
-      padding: 13px 18px;
-      border-radius: 10px;
-      font-weight: 700;
-      font-size: 14px;
-    }
+.chat {
+  background: #101624;
+  border: 1px solid #29344b;
+  border-radius: 16px;
+  overflow: hidden;
+}
 
-    .button.secondary {
-      background: #182236;
-      border: 1px solid #303d56;
-    }
+.chat-header {
+  padding: 17px;
+  border-bottom: 1px solid #29344b;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
 
-    .button:hover { opacity: .85; }
+.chat-title {
+  font-weight: bold;
+  font-size: 17px;
+}
 
-    footer {
-      border-top: 1px solid #20283a;
-      margin-top: 55px;
-      padding-top: 22px;
-      color: #66728a;
-      font-size: 12px;
-    }
+.chat-status {
+  color: #ffc66d;
+  font-size: 12px;
+}
 
-    @media(max-width: 500px) {
-      .container { padding: 22px 15px; }
-      .hero { padding-top: 45px; }
-      h1 { letter-spacing: -2px; }
-    }
-  </style>
+.chat-messages {
+  height: 400px;
+  overflow-y: auto;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.message {
+  padding: 12px 15px;
+  border-radius: 13px;
+  max-width: 85%;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.user-message {
+  background: #6554d9;
+  align-self: flex-end;
+}
+
+.ai-message {
+  background: #202b40;
+  align-self: flex-start;
+}
+
+.chat-input {
+  display: flex;
+  gap: 10px;
+  padding: 14px;
+  border-top: 1px solid #29344b;
+}
+
+.chat-input input {
+  flex: 1;
+  min-width: 0;
+  background: #080b12;
+  color: white;
+  border: 1px solid #35415a;
+  border-radius: 10px;
+  padding: 14px;
+  outline: none;
+  font-size: 15px;
+}
+
+button {
+  cursor: pointer;
+}
+
+.send-button {
+  background: #7665ed;
+  color: white;
+  border: none;
+  border-radius: 10px;
+  padding: 0 20px;
+  font-size: 18px;
+}
+
+.clear-button {
+  background: #202b40;
+  color: #aebbd2;
+  border: 1px solid #35415a;
+  border-radius: 8px;
+  padding: 8px 11px;
+}
+
+.buttons {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 20px;
+}
+
+.button {
+  display: inline-block;
+  padding: 12px 17px;
+  border-radius: 9px;
+  background: #7665ed;
+  color: white;
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: bold;
+}
+
+.button.secondary {
+  background: #182236;
+  border: 1px solid #303d56;
+}
+
+button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+footer {
+  border-top: 1px solid #20283a;
+  margin-top: 50px;
+  padding-top: 20px;
+  color: #66728a;
+  font-size: 12px;
+}
+
+@media(max-width:500px) {
+  .container {
+    padding: 20px 13px;
+  }
+
+  .chat-messages {
+    height: 350px;
+  }
+
+  .message {
+    max-width: 92%;
+  }
+
+  .chat-input {
+    padding: 10px;
+  }
+
+  .send-button {
+    padding: 0 15px;
+  }
+}
+</style>
 </head>
+
 <body>
-  <div class="container">
+<div class="container">
 
-    <header>
-      <div class="logo">NUMBAT<span> RUNNER</span></div>
-      <div class="status">● Ожидает запуска</div>
-    </header>
+<header>
+  <div class="logo">NUMBAT<span> RUNNER</span></div>
+  <div class="status">● Ожидает подключения ИИ</div>
+</header>
 
-    <main>
-      <section class="hero">
-        <div class="tag">AI MODEL CONTROL CENTER</div>
-        <h1>Meet <span>Numbat.</span></h1>
-        <p class="description">
-          Панель управления проектом Numbat Runner.
-          Подготовка окружения, проверка ресурсов и
-          управление будущим запуском модели.
-        </p>
+<main>
 
-        <div class="buttons">
-          <a class="button" href="https://github.com/haniirting/Numbat-Runner/actions">
-            Открыть Actions →
-          </a>
-          <a class="button secondary"
-             href="https://huggingface.co/burner22/numbat">
-            Модель на Hugging Face
-          </a>
-        </div>
-      </section>
+<section class="hero">
+  <div class="tag">AI MODEL CONTROL CENTER</div>
+  <h1>Meet <span>Numbat.</span></h1>
+  <p class="description">
+    Твоя собственная платформа для общения с искусственным
+    интеллектом Numbat.
+  </p>
 
-      <h2 class="section-title">Состояние проекта</h2>
-
-      <div class="grid">
-        <div class="card">
-          <small>Проект</small>
-          <div class="value">Numbat Runner</div>
-          <div class="muted">Главная панель</div>
-        </div>
-
-        <div class="card">
-          <small>Окружение</small>
-          <div class="value">Не проверено</div>
-          <div class="muted">Ожидает Preflight</div>
-        </div>
-
-        <div class="card">
-          <small>Модель</small>
-          <div class="value">Не загружена</div>
-          <div class="muted">burner22/numbat</div>
-        </div>
-      </div>
-
-      <h2 class="section-title">Информация о модели</h2>
-
-      <div class="card">
-        <div class="value">Numbat</div>
-        <p class="muted">
-          Источник: Hugging Face / burner22
-        </p>
-        <p class="muted">
-          В репозитории заявлен объём файлов около 7,72 ТБ.
-          Эти характеристики пока не подтверждены независимо.
-        </p>
-      </div>
-
-      <div class="warning">
-        <strong>Внимание: требования к ресурсам</strong><br>
-        Обычные GitHub Actions Runner не предназначены
-        для загрузки и запуска модели такого размера.
-        Сейчас мы используем GitHub для подготовки проекта
-        и безопасной проверки окружения.
-      </div>
-
-      <h2 class="section-title">План разработки</h2>
-
-      <div class="grid">
-        <div class="card">
-          <small>Этап 01</small>
-          <div class="value">Подготовка</div>
-          <div class="muted">Создание файлов проекта</div>
-        </div>
-
-        <div class="card">
-          <small>Этап 02</small>
-          <div class="value">Preflight</div>
-          <div class="muted">Проверка ресурсов сервера</div>
-        </div>
-
-        <div class="card">
-          <small>Этап 03</small>
-          <div class="value">Загрузка</div>
-          <div class="muted">Поиск подходящего хранилища</div>
-        </div>
-
-        <div class="card">
-          <small>Этап 04</small>
-          <div class="value">Запуск</div>
-          <div class="muted">Подключение вычислительной системы</div>
-        </div>
-      </div>
-    </main>
-
-    <footer>
-      NUMBAT RUNNER · Independent experimental project · 2026
-    </footer>
-
+  <div class="buttons">
+    <a class="button" href="https://github.com/haniirting/Numbat-Runner/actions">
+      GitHub Actions →
+    </a>
+    <a class="button secondary"
+       href="https://huggingface.co/burner22/numbat">
+      Hugging Face
+    </a>
   </div>
+</section>
+
+<h2 class="section-title">Состояние проекта</h2>
+
+<div class="grid">
+  <div class="card">
+    <small>Проект</small>
+    <div class="value">Numbat Runner</div>
+    <div class="muted">Главная панель</div>
+  </div>
+
+  <div class="card">
+    <small>Модель</small>
+    <div class="value">Numbat</div>
+    <div class="muted">burner22/numbat</div>
+  </div>
+
+  <div class="card">
+    <small>Подключение</small>
+    <div class="value">Ожидание</div>
+    <div class="muted">Сервер ещё не настроен</div>
+  </div>
+</div>
+
+<div class="warning">
+  <strong>Важно</strong><br>
+  GitHub Pages предоставляет интерфейс сайта,
+  но не запускает модель. Для настоящих ответов
+  понадобится отдельный вычислительный сервер.
+  Заявленный размер файлов модели — около 7,72 ТБ;
+  эти характеристики пока независимо не проверены.
+</div>
+
+<h2 class="section-title">Numbat AI Chat</h2>
+
+<div class="chat">
+
+  <div class="chat-header">
+    <div>
+      <div class="chat-title">🧠 Numbat Assistant</div>
+      <div class="chat-status" id="chatStatus">
+        ● Интерфейс готов · ИИ не подключён
+      </div>
+    </div>
+
+    <button class="clear-button" id="clearChat">
+      Очистить
+    </button>
+  </div>
+
+  <div class="chat-messages" id="messages">
+    <div class="message ai-message">
+      Привет! Я Numbat Assistant.
+
+      Мой интерфейс уже готов. Сейчас ожидаю подключения
+      настоящей модели искусственного интеллекта.
+    </div>
+  </div>
+
+  <form class="chat-input" id="chatForm">
+    <input
+      id="chatInput"
+      type="text"
+      placeholder="Напиши сообщение..."
+      autocomplete="off"
+      required
+    >
+    <button class="send-button" type="submit">➤</button>
+  </form>
+
+</div>
+
+<h2 class="section-title">Этапы разработки</h2>
+
+<div class="grid">
+  <div class="card">
+    <small>01</small>
+    <div class="value">Интерфейс</div>
+    <div class="muted">Готово</div>
+  </div>
+
+  <div class="card">
+    <small>02</small>
+    <div class="value">Preflight</div>
+    <div class="muted">Готово</div>
+  </div>
+
+  <div class="card">
+    <small>03</small>
+    <div class="value">Сервер ИИ</div>
+    <div class="muted">Ожидает настройки</div>
+  </div>
+
+  <div class="card">
+    <small>04</small>
+    <div class="value">Numbat</div>
+    <div class="muted">Ожидает запуска</div>
+  </div>
+</div>
+
+</main>
+
+<footer>
+  NUMBAT RUNNER · Independent experimental project · 2026
+</footer>
+
+</div>
+
+<script>
+const form = document.getElementById("chatForm");
+const input = document.getElementById("chatInput");
+const messages = document.getElementById("messages");
+const clearButton = document.getElementById("clearChat");
+
+function addMessage(text, type) {
+  const bubble = document.createElement("div");
+  bubble.className = "message " + type;
+  bubble.textContent = text;
+  messages.appendChild(bubble);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+form.addEventListener("submit", function(event) {
+  event.preventDefault();
+
+  const text = input.value.trim();
+
+  if (!text) return;
+
+  addMessage(text, "user-message");
+
+  addMessage(
+    "Сообщение добавлено в чат. Настоящий ИИ пока не подключён. После настройки сервера здесь появятся ответы Numbat.",
+    "ai-message"
+  );
+
+  input.value = "";
+});
+
+clearButton.addEventListener("click", function() {
+  messages.innerHTML = "";
+
+  addMessage(
+    "История переписки очищена. Я готов к новому диалогу после подключения модели.",
+    "ai-message"
+  );
+});
+</script>
+
 </body>
 </html>
