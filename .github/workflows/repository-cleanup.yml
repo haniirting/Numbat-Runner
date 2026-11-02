@@ -1,4 +1,4 @@
-name: Repository Cleanup
+name: Final Repository Cleanup
 
 on:
   workflow_dispatch:
@@ -13,6 +13,42 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
-      - name: Run cleanup script
-        run: python scripts/cleanup_old_files.py
+      - name: Delete files and itself
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          files=(
+            "scripts/launch_model_test.py"
+            "scripts/dynamic_loader.py"
+            "scripts/inspect_shards.py"
+            "scripts/preflight.py"
+            "scripts/range_probe.py"
+            ".github/workflows/repository-cleanup.yml"
+          )
+
+          for file in "${files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "[DELETE] $file"
+            else
+              echo "[NOT FOUND] $file"
+            fi
+          done
+
+          git rm --ignore-unmatch -- "${files[@]}"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to delete."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Remove remaining Numbat scripts"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "CLEANUP COMPLETE"
