@@ -1,0 +1,132 @@
+name: Numbat Inference - Stage 1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Inspect Numbat model
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+          import sys
+
+          REPO = "burner22/numbat"
+          BASE = f"https://huggingface.co/{REPO}/resolve/main"
+
+          def get_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Numbat-Runner/1.0"}
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.loads(response.read())
+
+          print("=" * 60)
+          print("NUMBAT MODEL INSPECTOR")
+          print("=" * 60)
+
+          try:
+              config = get_json(f"{BASE}/config.json")
+
+              print("\nMODEL CONFIG")
+              for key in (
+                  "model_type",
+                  "architectures",
+                  "num_hidden_layers",
+                  "hidden_size",
+                  "intermediate_size",
+                  "num_attention_heads",
+                  "num_key_value_heads",
+                  "num_local_experts",
+                  "num_experts",
+                  "num_experts_per_tok",
+                  "torch_dtype"
+              ):
+                  if key in config:
+                      print(f"{key}: {config[key]}")
+
+              print("\nWEIGHT INDEX")
+              try:
+                  index = get_json(
+                      f"{BASE}/model.safetensors.index.json"
+                  )
+
+                  weight_map = index.get("weight_map", {})
+                  shards = sorted(set(weight_map.values()))
+
+                  print("Index found: YES")
+                  print(f"Tensor count: {len(weight_map):,}")
+                  print(f"Shard count: {len(shards):,}")
+
+                  layer_ids = set()
+                  expert_ids = set()
+
+                  for name in weight_map:
+                      parts = name.split(".")
+                      for i, part in enumerate(parts):
+                          if part == "layers" and i + 1 < len(parts):
+                              layer_ids.add(parts[i + 1])
+                          if part == "experts" and i + 1 < len(parts):
+                              expert_ids.add(parts[i + 1])
+
+                  print(f"Detected layers: {len(layer_ids)}")
+                  print(f"Detected expert IDs: {len(expert_ids)}")
+
+                  print("\nSAMPLE TENSORS")
+                  for name in list(weight_map)[:15]:
+                      print(f"{name} -> {weight_map[name]}")
+
+              except Exception as error:
+                  print("Index found: NO")
+                  print(f"Index error: {error}")
+
+              print("\nMODEL FILE LIST")
+              api = get_json(
+                  f"https://huggingface.co/api/models/{REPO}?blobs=true"
+              )
+
+              siblings = api.get("siblings", [])
+              print(f"Files listed: {len(siblings):,}")
+
+              total_bytes = 0
+              known_sizes = 0
+
+              for item in siblings:
+                  name = item.get("rfilename", "")
+                  if name.endswith(".safetensors"):
+                      size = item.get("size")
+                      if size is None:
+                          size = (item.get("lfs") or {}).get("size")
+                      if size is not None:
+                          total_bytes += int(size)
+                          known_sizes += 1
+
+              print(f"Safetensors files with known sizes: {known_sizes}")
+              if known_sizes:
+                  print(f"Total weights: {total_bytes:,} bytes")
+                  print(f"Total weights: {total_bytes / 1e12:.3f} TB")
+
+              print("\nINSPECTION COMPLETE")
+              print("No model weights were downloaded.")
+              print("No inference was performed.")
+
+          except Exception as error:
+              print("\nINSPECTION FAILED")
+              print(repr(error))
+              sys.exit(1)
+          PY
