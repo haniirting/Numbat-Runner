@@ -13,8 +13,7 @@ BASE = (
 )
 
 MAX_HEADER = 64 * 1024 * 1024
-MIN_TENSOR = 1024
-MAX_TENSOR = 1024 * 1024
+MAX_TENSOR = 64 * 1024 * 1024
 
 
 def get_range(start, end):
@@ -26,8 +25,7 @@ def get_range(start, end):
             "User-Agent": "Numbat-Runner/1.0"
         },
         stream=True,
-        timeout=90,
-        allow_redirects=True
+        timeout=120
     )
 
     if response.status_code != 206:
@@ -41,54 +39,40 @@ def get_range(start, end):
 
     if not content_range.startswith(f"bytes {start}-{end}/"):
         response.close()
-        raise RuntimeError(
-            f"Unexpected Content-Range: {content_range}"
-        )
+        raise RuntimeError(f"Unexpected Content-Range: {content_range}")
 
     data = bytearray()
 
     try:
         for chunk in response.iter_content(65536):
             data.extend(chunk)
-
             if len(data) > expected:
-                raise RuntimeError("Server returned too much data")
+                raise RuntimeError("Too much data received")
     finally:
         response.close()
 
     if len(data) != expected:
         raise RuntimeError(
-            f"Incomplete range: {len(data)} / {expected}"
+            f"Incomplete download: {len(data)} / {expected}"
         )
 
     return bytes(data)
 
 
 def main():
-    print("NUMBAT RANGE PROBE")
-    print("=" * 50)
+    print("NUMBAT TENSOR RANGE PROBE")
+    print("=" * 55)
     print("Shard:", SHARD)
 
-    # 1. Читаем длину заголовка Safetensors
     first = get_range(0, 7)
     header_size = struct.unpack("<Q", first)[0]
 
     if not 0 < header_size <= MAX_HEADER:
-        raise RuntimeError(
-            f"Invalid header size: {header_size}"
-        )
+        raise RuntimeError("Invalid Safetensors header")
 
-    print("Header size:", header_size)
-
-    # 2. Загружаем только заголовок
-    header_bytes = get_range(
-        8,
-        8 + header_size - 1
-    )
-
+    header_bytes = get_range(8, 8 + header_size - 1)
     header = json.loads(header_bytes.decode("utf-8"))
 
-    # 3. Ищем настоящий небольшой тензор
     tensors = []
 
     for name, info in header.items():
@@ -97,46 +81,49 @@ def main():
 
         start, end = info["data_offsets"]
         size = end - start
+        shape = info.get("shape", [])
 
-        if (
-            MIN_TENSOR <= size <= MAX_TENSOR
-            and info.get("shape")
-        ):
+        if size > 0 and shape:
             tensors.append((size, name, info))
 
-    print("Tensors in shard:", len(header) - 1)
-    print("Suitable tensors:", len(tensors))
+    print("Total tensors:", len(header) - 1)
+    print("Non-scalar tensors:", len(tensors))
 
-    if not tensors:
-        print("No suitable tensor found.")
+    tensors.sort(key=lambda item: item[0])
+
+    print("\nSmallest tensors:")
+    for size, name, info in tensors[:15]:
+        print(
+            f"{size:>12} bytes | "
+            f"{info['dtype']} | "
+            f"{info['shape']} | {name}"
+        )
+
+    candidates = [
+        item for item in tensors
+        if item[0] <= MAX_TENSOR
+    ]
+
+    if not candidates:
+        print("\nNo tensor up to 64 MiB found.")
+        print("No tensor data downloaded.")
         return
 
-    # Берём самый маленький подходящий тензор
-    size, name, info = min(
-        tensors,
-        key=lambda item: item[0]
-    )
+    size, name, info = candidates[0]
 
     print("\nSelected tensor:", name)
     print("Dtype:", info["dtype"])
     print("Shape:", info["shape"])
     print("Size:", size, "bytes")
 
-    # 4. Вычисляем абсолютные смещения
-    data_start = (
-        8
-        + header_size
-        + info["data_offsets"][0]
-    )
-
+    data_start = 8 + header_size + info["data_offsets"][0]
     data_end = data_start + size - 1
 
-    # 5. Загружаем только данные этого тензора
     tensor_data = get_range(data_start, data_end)
 
     print("\nDownloaded bytes:", len(tensor_data))
     print("Full shard downloaded: NO")
-    print("Tensor stored temporarily in RAM.")
+    print("Tensor data stored temporarily in RAM.")
     print("RANGE PROBE SUCCESS")
 
 
