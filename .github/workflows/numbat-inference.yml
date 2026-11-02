@@ -1,4 +1,4 @@
-name: Numbat Inference - Stage 2
+name: Numbat Inference - Stage 3 NVFP4
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  selective-download:
+  inspect-nvfp4:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Set up Python
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download one tensor using HTTP Range
+      - name: Download NVFP4 components
         shell: bash
         run: |
           python - <<'PY'
@@ -28,46 +28,37 @@ jobs:
 
           REPO = "burner22/numbat"
           TARGET = "model.layers.10.mlp.experts.100.gate_proj.weight"
-
           BASE = f"https://huggingface.co/{REPO}/resolve/main"
-          API = f"https://huggingface.co/api/models/{REPO}"
-          MAX_BYTES = 64 * 1024 * 1024
+          MAX_TENSOR = 64 * 1024 * 1024
 
           def get(url):
               req = urllib.request.Request(
                   url,
-                  headers={"User-Agent": "Numbat-Runner/2.1"}
+                  headers={"User-Agent": "Numbat-Runner/3.0"}
               )
-              with urllib.request.urlopen(req, timeout=120) as response:
-                  return response.read()
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return r.read()
 
-          def request_range(url, start, end):
+          def get_range(url, start, end):
               req = urllib.request.Request(
                   url,
                   headers={
                       "Range": f"bytes={start}-{end}",
-                      "User-Agent": "Numbat-Runner/2.1"
+                      "User-Agent": "Numbat-Runner/3.0"
                   }
               )
 
-              with urllib.request.urlopen(req, timeout=120) as response:
-                  if response.status != 206:
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  if r.status != 206:
                       raise RuntimeError(
-                          f"Expected HTTP 206, got {response.status}"
+                          f"Expected HTTP 206, got {r.status}"
                       )
 
-                  content_range = response.headers.get(
-                      "Content-Range", ""
-                  )
+                  cr = r.headers.get("Content-Range", "")
+                  if not cr.startswith(f"bytes {start}-{end}/"):
+                      raise RuntimeError(f"Bad Content-Range: {cr}")
 
-                  if not content_range.startswith(
-                      f"bytes {start}-{end}/"
-                  ):
-                      raise RuntimeError(
-                          f"Unexpected Content-Range: {content_range}"
-                      )
-
-                  data = response.read()
+                  data = r.read()
 
               if len(data) != end - start + 1:
                   raise RuntimeError("Incomplete range response")
@@ -75,77 +66,107 @@ jobs:
               return data
 
           print("=" * 60)
-          print("NUMBAT SELECTIVE TENSOR DOWNLOAD")
+          print("NUMBAT NVFP4 COMPONENT INSPECTOR")
           print("=" * 60)
 
-          print("\nSTEP 1: Download tensor index")
+          print("\nSTEP 1: Load tensor index")
 
-          index_url = f"{BASE}/model.safetensors.index.json"
-          index = json.loads(get(index_url))
-
+          index = json.loads(
+              get(f"{BASE}/model.safetensors.index.json")
+          )
           weight_map = index["weight_map"]
 
-          if TARGET not in weight_map:
-              raise RuntimeError(f"Tensor not found: {TARGET}")
+          prefix = TARGET.rsplit(".", 1)[0]
+          names = [
+              prefix + ".weight",
+              prefix + ".weight_scale",
+              prefix + ".weight_scale_2",
+              prefix + ".input_scale"
+          ]
 
-          shard = weight_map[TARGET]
-          url = f"{BASE}/{shard}"
+          for name in names:
+              if name not in weight_map:
+                  raise RuntimeError(f"Missing component: {name}")
 
-          print(f"Index loaded: {len(weight_map):,} tensors")
-          print(f"Target: {TARGET}")
-          print(f"Shard: {shard}")
+          print("All four components found in index.")
 
-          print("\nSTEP 2: Read Safetensors header")
+          total_downloaded = 0
+          results = []
 
-          first_bytes = request_range(url, 0, 7)
-          header_size = struct.unpack("<Q", first_bytes)[0]
+          print("\nSTEP 2: Download components selectively")
 
-          if header_size > 100 * 1024 * 1024:
-              raise RuntimeError("Header is unexpectedly large")
+          for name in names:
+              shard = weight_map[name]
+              url = f"{BASE}/{shard}"
 
-          header_bytes = request_range(url, 8, 7 + header_size)
-          header = json.loads(header_bytes)
+              print(f"\nCOMPONENT: {name}")
+              print(f"SHARD: {shard}")
 
-          if TARGET not in header:
-              raise RuntimeError("Tensor missing from shard header")
+              first = get_range(url, 0, 7)
+              header_size = struct.unpack("<Q", first)[0]
 
-          metadata = header[TARGET]
-          dtype = metadata["dtype"]
-          shape = metadata["shape"]
-          offsets = metadata["data_offsets"]
+              if header_size > 100 * 1024 * 1024:
+                  raise RuntimeError("Header too large")
 
-          data_start = 8 + header_size + offsets[0]
-          data_end = 8 + header_size + offsets[1] - 1
-          tensor_size = data_end - data_start + 1
+              header_bytes = get_range(
+                  url, 8, 7 + header_size
+              )
+              header = json.loads(header_bytes)
 
-          print(f"Header size: {header_size:,} bytes")
-          print(f"Dtype: {dtype}")
-          print(f"Shape: {shape}")
-          print(f"Tensor size: {tensor_size:,} bytes")
+              if name not in header:
+                  raise RuntimeError(
+                      f"Component missing from shard header: {name}"
+                  )
 
-          if tensor_size <= 0 or tensor_size > MAX_BYTES:
-              raise RuntimeError("Tensor exceeds safety limit")
+              meta = header[name]
+              start_offset, end_offset = meta["data_offsets"]
 
-          print("\nSTEP 3: Download only selected tensor")
+              data_start = 8 + header_size + start_offset
+              data_end = 8 + header_size + end_offset - 1
+              size = data_end - data_start + 1
 
-          tensor_data = request_range(url, data_start, data_end)
-          digest = hashlib.sha256(tensor_data).hexdigest()
+              if size <= 0 or size > MAX_TENSOR:
+                  raise RuntimeError(
+                      f"Unsafe tensor size: {size}"
+                  )
 
-          with open("/tmp/numbat_selected_tensor.bin", "wb") as f:
-              f.write(tensor_data)
+              data = get_range(url, data_start, data_end)
+              digest = hashlib.sha256(data).hexdigest()
 
-          print(f"Downloaded: {len(tensor_data):,} bytes")
-          print(f"SHA256: {digest}")
+              if len(data) != size:
+                  raise RuntimeError("Size mismatch")
 
-          print("\nSTEP 4: Verify")
+              total_downloaded += len(data)
 
-          assert len(tensor_data) == tensor_size
+              results.append({
+                  "name": name,
+                  "dtype": meta["dtype"],
+                  "shape": meta["shape"],
+                  "bytes": len(data),
+                  "sha256": digest
+              })
 
-          print("HTTP Range: PASS")
-          print("Tensor metadata: PASS")
-          print("Tensor download: PASS")
-          print("Size verification: PASS")
-          print("\nSELECTIVE DOWNLOAD SUCCESSFUL")
+              print(f" Dtype: {meta['dtype']}")
+              print(f" Shape: {meta['shape']}")
+              print(f" Bytes: {len(data):,}")
+              print(f" SHA256: {digest}")
+
+              del data
+
+          print("\nSTEP 3: Summary")
+          print(f"Components downloaded: {len(results)}")
+          print(f"Total bytes: {total_downloaded:,}")
+          print(f"Total MiB: {total_downloaded / 1024**2:.2f}")
+
+          print("\nCOMPONENT SUMMARY")
+          for item in results:
+              print(
+                  f"{item['name'].rsplit('.', 1)[-1]}: "
+                  f"{item['dtype']} {item['shape']}"
+              )
+
+          print("\nNVFP4 COMPONENT DOWNLOAD SUCCESSFUL")
+          print("Only selected tensor data was downloaded.")
           print("No complete shard was downloaded.")
           print("No inference was performed.")
           PY
