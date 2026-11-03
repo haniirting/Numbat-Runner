@@ -1,4 +1,4 @@
-name: Numbat Inference - Stage 3 NVFP4
+name: Numbat End-to-End Diagnostic
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  inspect-nvfp4:
+  diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - name: Set up Python
@@ -17,156 +17,354 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download NVFP4 components
+      - name: Install ML runtime
+        continue-on-error: true
+        run: |
+          python -m pip install --no-cache-dir \
+            torch transformers accelerate safetensors \
+            huggingface_hub psutil
+
+      - name: Run complete diagnostic
+        id: diagnostic
+        if: always()
+        continue-on-error: true
         shell: bash
         run: |
-          python - <<'PY'
+          set +e
+
+          python - <<'PY' > numbat-diagnostic.log 2>&1
+          import os
+          import sys
           import json
+          import time
+          import shutil
+          import traceback
           import urllib.request
-          import struct
-          import hashlib
 
           REPO = "burner22/numbat"
-          TARGET = "model.layers.10.mlp.experts.100.gate_proj.weight"
-          BASE = f"https://huggingface.co/{REPO}/resolve/main"
-          MAX_TENSOR = 64 * 1024 * 1024
+          BASE = f"https://huggingface.co/{REPO}"
 
-          def get(url):
-              req = urllib.request.Request(
-                  url,
-                  headers={"User-Agent": "Numbat-Runner/3.0"}
+          failed = False
+          model_size = None
+          config = None
+          model = None
+          tokenizer = None
+
+          def section(name):
+              print("\n" + "=" * 65)
+              print(name)
+              print("=" * 65, flush=True)
+
+          def error(name):
+              global failed
+              failed = True
+              print(f"\n[ERROR] {name}")
+              traceback.print_exc()
+
+          print("NUMBAT END-TO-END DIAGNOSTIC")
+          print("Started:", time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+          print("Repository:", REPO)
+
+          # 1. SYSTEM RESOURCES
+
+          section("1. RUNNER HARDWARE")
+
+          try:
+              import psutil
+
+              memory = psutil.virtual_memory()
+              disk = shutil.disk_usage("/")
+
+              print("CPU cores:", os.cpu_count())
+              print(f"RAM total: {memory.total / 1024**3:.2f} GB")
+              print(f"RAM available: {memory.available / 1024**3:.2f} GB")
+              print(f"Disk total: {disk.total / 1024**3:.2f} GB")
+              print(f"Disk free: {disk.free / 1024**3:.2f} GB")
+
+              import torch
+
+              print("PyTorch:", torch.__version__)
+              print("CUDA available:", torch.cuda.is_available())
+
+              if torch.cuda.is_available():
+                  print("GPU:", torch.cuda.get_device_name(0))
+                  print(
+                      "GPU memory:",
+                      torch.cuda.get_device_properties(0).total_memory
+                      / 1024**3,
+                      "GB"
+                  )
+              else:
+                  print("GPU: NOT AVAILABLE")
+
+          except Exception:
+              error("Hardware inspection failed")
+
+          # 2. MODEL METADATA
+
+          section("2. MODEL METADATA")
+
+          try:
+              request = urllib.request.Request(
+                  f"https://huggingface.co/api/models/{REPO}?blobs=true",
+                  headers={"User-Agent": "Numbat-Diagnostic/1.0"}
               )
-              with urllib.request.urlopen(req, timeout=120) as r:
-                  return r.read()
 
-          def get_range(url, start, end):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      "Range": f"bytes={start}-{end}",
-                      "User-Agent": "Numbat-Runner/3.0"
-                  }
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  model_info = json.loads(response.read())
+
+              files = model_info.get("siblings", [])
+              total = 0
+              known = 0
+
+              for item in files:
+                  name = item.get("rfilename", "")
+                  if name.endswith(".safetensors"):
+                      size = item.get("size")
+                      if size is None:
+                          size = (item.get("lfs") or {}).get("size")
+                      if size is not None:
+                          total += int(size)
+                          known += 1
+
+              model_size = total
+
+              print("Repository files:", len(files))
+              print("Weight shards:", known)
+              print(f"Total weight size: {total:,} bytes")
+              print(f"Total weight size: {total / 1e12:.3f} TB")
+
+          except Exception:
+              error("Could not retrieve model metadata")
+
+          # 3. DOWNLOAD ONLY CONFIGURATION AND MODEL CODE
+
+          section("3. MODEL CONFIGURATION")
+
+          local_path = None
+
+          try:
+              from huggingface_hub import snapshot_download
+
+              local_path = snapshot_download(
+                  repo_id=REPO,
+                  allow_patterns=[
+                      "config.json",
+                      "*.py",
+                      "tokenizer*",
+                      "special_tokens_map.json",
+                      "generation_config.json",
+                      "vocab.json",
+                      "merges.txt",
+                      "*.model",
+                      "added_tokens.json"
+                  ]
               )
 
-              with urllib.request.urlopen(req, timeout=120) as r:
-                  if r.status != 206:
-                      raise RuntimeError(
-                          f"Expected HTTP 206, got {r.status}"
+              print("Configuration downloaded:", local_path)
+              print("Full model weights were NOT downloaded.")
+
+          except Exception:
+              error("Configuration or model-code download failed")
+
+          # 4. LOAD CONFIGURATION AND TOKENIZER
+
+          section("4. TRANSFORMERS INITIALIZATION")
+
+          if local_path:
+              try:
+                  from transformers import AutoConfig
+
+                  print("Loading custom Numbat configuration...")
+                  config = AutoConfig.from_pretrained(
+                      local_path,
+                      trust_remote_code=True
+                  )
+
+                  print("Configuration loaded.")
+                  print("Model class:", type(config).__name__)
+                  print("Model type:", getattr(config, "model_type", None))
+                  print("Architectures:", getattr(config, "architectures", None))
+                  print("Layers:", getattr(config, "num_hidden_layers", None))
+                  print("Hidden size:", getattr(config, "hidden_size", None))
+
+              except Exception:
+                  error("AutoConfig initialization failed")
+
+              try:
+                  from transformers import AutoTokenizer
+
+                  print("\nLoading tokenizer...")
+                  tokenizer = AutoTokenizer.from_pretrained(
+                      local_path,
+                      trust_remote_code=True
+                  )
+
+                  print("Tokenizer loaded.")
+                  print("Tokenizer class:", type(tokenizer).__name__)
+
+              except Exception:
+                  print("TOKENIZER INITIALIZATION FAILED")
+                  traceback.print_exc()
+
+          # 5. EMPTY MODEL INITIALIZATION
+
+          section("5. EMPTY ARCHITECTURE INITIALIZATION")
+
+          architecture_ok = False
+
+          if config is not None:
+              try:
+                  from accelerate import init_empty_weights
+                  from transformers import AutoModelForCausalLM
+
+                  print("Creating model on meta device.")
+                  print("No pretrained weights will be loaded.")
+
+                  with init_empty_weights(include_buffers=True):
+                      model = AutoModelForCausalLM.from_config(
+                          config,
+                          trust_remote_code=True
                       )
 
-                  cr = r.headers.get("Content-Range", "")
-                  if not cr.startswith(f"bytes {start}-{end}/"):
-                      raise RuntimeError(f"Bad Content-Range: {cr}")
-
-                  data = r.read()
-
-              if len(data) != end - start + 1:
-                  raise RuntimeError("Incomplete range response")
-
-              return data
-
-          print("=" * 60)
-          print("NUMBAT NVFP4 COMPONENT INSPECTOR")
-          print("=" * 60)
-
-          print("\nSTEP 1: Load tensor index")
-
-          index = json.loads(
-              get(f"{BASE}/model.safetensors.index.json")
-          )
-          weight_map = index["weight_map"]
-
-          prefix = TARGET.rsplit(".", 1)[0]
-          names = [
-              prefix + ".weight",
-              prefix + ".weight_scale",
-              prefix + ".weight_scale_2",
-              prefix + ".input_scale"
-          ]
-
-          for name in names:
-              if name not in weight_map:
-                  raise RuntimeError(f"Missing component: {name}")
-
-          print("All four components found in index.")
-
-          total_downloaded = 0
-          results = []
-
-          print("\nSTEP 2: Download components selectively")
-
-          for name in names:
-              shard = weight_map[name]
-              url = f"{BASE}/{shard}"
-
-              print(f"\nCOMPONENT: {name}")
-              print(f"SHARD: {shard}")
-
-              first = get_range(url, 0, 7)
-              header_size = struct.unpack("<Q", first)[0]
-
-              if header_size > 100 * 1024 * 1024:
-                  raise RuntimeError("Header too large")
-
-              header_bytes = get_range(
-                  url, 8, 7 + header_size
-              )
-              header = json.loads(header_bytes)
-
-              if name not in header:
-                  raise RuntimeError(
-                      f"Component missing from shard header: {name}"
+                  params = sum(
+                      p.numel() for p in model.parameters()
                   )
 
-              meta = header[name]
-              start_offset, end_offset = meta["data_offsets"]
+                  print("Architecture initialized successfully.")
+                  print("Model class:", type(model).__name__)
+                  print(f"Parameter count: {params:,}")
+                  architecture_ok = True
 
-              data_start = 8 + header_size + start_offset
-              data_end = 8 + header_size + end_offset - 1
-              size = data_end - data_start + 1
+                  del model
+                  model = None
 
-              if size <= 0 or size > MAX_TENSOR:
-                  raise RuntimeError(
-                      f"Unsafe tensor size: {size}"
-                  )
+              except Exception:
+                  error("Empty architecture initialization failed")
 
-              data = get_range(url, data_start, data_end)
-              digest = hashlib.sha256(data).hexdigest()
+          else:
+              print("SKIPPED: configuration unavailable")
 
-              if len(data) != size:
-                  raise RuntimeError("Size mismatch")
+          # 6. REAL RESOURCE CHECK
 
-              total_downloaded += len(data)
+          section("6. FULL MODEL RESOURCE CHECK")
 
-              results.append({
-                  "name": name,
-                  "dtype": meta["dtype"],
-                  "shape": meta["shape"],
-                  "bytes": len(data),
-                  "sha256": digest
-              })
+          if model_size is not None:
+              try:
+                  import psutil
 
-              print(f" Dtype: {meta['dtype']}")
-              print(f" Shape: {meta['shape']}")
-              print(f" Bytes: {len(data):,}")
-              print(f" SHA256: {digest}")
+                  disk_free = shutil.disk_usage("/").free
+                  ram_available = psutil.virtual_memory().available
 
-              del data
+                  print(f"Model weights: {model_size / 1e12:.3f} TB")
+                  print(f"Available disk: {disk_free / 1e12:.3f} TB")
+                  print(f"Available RAM: {ram_available / 1e12:.3f} TB")
 
-          print("\nSTEP 3: Summary")
-          print(f"Components downloaded: {len(results)}")
-          print(f"Total bytes: {total_downloaded:,}")
-          print(f"Total MiB: {total_downloaded / 1024**2:.2f}")
+                  required = int(model_size * 1.20)
 
-          print("\nCOMPONENT SUMMARY")
-          for item in results:
-              print(
-                  f"{item['name'].rsplit('.', 1)[-1]}: "
-                  f"{item['dtype']} {item['shape']}"
-              )
+                  print(f"Estimated safe storage requirement: {required:,} bytes")
 
-          print("\nNVFP4 COMPONENT DOWNLOAD SUCCESSFUL")
-          print("Only selected tensor data was downloaded.")
-          print("No complete shard was downloaded.")
-          print("No inference was performed.")
+                  enough_disk = disk_free >= required
+                  enough_ram = ram_available >= required
+
+                  print("Disk requirement met:", enough_disk)
+                  print("RAM requirement met:", enough_ram)
+
+                  if not (enough_disk and enough_ram):
+                      print("\nFULL MODEL LOAD BLOCKED")
+                      print("Reason: insufficient runner resources.")
+                      print("No complete weight download was attempted.")
+
+                  else:
+                      section("7. ACTUAL MODEL LOAD AND GENERATION")
+
+                      from transformers import AutoModelForCausalLM
+
+                      loaded = AutoModelForCausalLM.from_pretrained(
+                          REPO,
+                          trust_remote_code=True,
+                          device_map="auto",
+                          torch_dtype="auto",
+                          low_cpu_mem_usage=True
+                      )
+
+                      print("MODEL WEIGHTS LOADED.")
+
+                      if tokenizer is None:
+                          raise RuntimeError("Tokenizer unavailable")
+
+                      import torch
+
+                      inputs = tokenizer(
+                          "Hello! Introduce yourself briefly.",
+                          return_tensors="pt"
+                      )
+
+                      device = next(loaded.parameters()).device
+                      inputs = {
+                          key: value.to(device)
+                          for key, value in inputs.items()
+                      }
+
+                      print("Starting text generation...")
+
+                      with torch.inference_mode():
+                          output = loaded.generate(
+                              **inputs,
+                              max_new_tokens=8,
+                              do_sample=False
+                          )
+
+                      print("GENERATED TEXT:")
+                      print(tokenizer.decode(
+                          output[0],
+                          skip_special_tokens=True
+                      ))
+
+                      print("\nINFERENCE SUCCESSFUL")
+
+              except Exception:
+                  error("Resource check or actual model execution failed")
+
+          else:
+              print("Cannot calculate resource requirements.")
+
+          # 7. FINAL RESULT
+
+          section("FINAL DIAGNOSTIC RESULT")
+
+          if failed:
+              print("RESULT: ERRORS DETECTED")
+          elif model_size is not None:
+              print("RESULT: DIAGNOSTIC COMPLETED")
+          else:
+              print("RESULT: INCOMPLETE")
+
+          print("Architecture initialized:", architecture_ok)
+          print("Model size known:", model_size is not None)
+          print("Full inference is NOT claimed unless generation succeeded.")
+          print("\nEND OF DIAGNOSTIC")
+
           PY
+
+          STATUS=$?
+          cat numbat-diagnostic.log
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+          exit "$STATUS"
+
+      - name: Upload complete diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: numbat-complete-diagnostic
+          path: numbat-diagnostic.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Add result to summary
+        if: always()
+        run: |
+          if [ -f numbat-diagnostic.log ]; then
+            echo "## Numbat diagnostic" >> "$GITHUB_STEP_SUMMARY"
+            tail -n 60 numbat-diagnostic.log >> "$GITHUB_STEP_SUMMARY"
+          fi
