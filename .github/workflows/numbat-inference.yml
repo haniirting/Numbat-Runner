@@ -1,3 +1,4 @@
+
 name: Numbat Full Forensic Scan
 
 on:
@@ -7,210 +8,560 @@ permissions:
   contents: read
 
 jobs:
-  forensic:
+  forensic-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     steps:
-      - name: Set up Python
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Install NumPy
-        run: python -m pip install numpy
-
-      - name: Scan model tensors
-        shell: bash
+      - name: Install dependencies
         run: |
-          python - <<'PY' > numbat-forensics.log 2>&1
-          import json
+          python -m pip install --upgrade pip
+          pip install numpy requests
+
+      - name: Run complete forensic scan
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          cat > numbat_full_scan.py <<'PY'
           import hashlib
+          import json
           import struct
-          import urllib.request
+          import csv
+          import time
+          from collections import Counter
+          from pathlib import Path
+
           import numpy as np
+          import requests
 
           REPO = "burner22/numbat"
           BASE = f"https://huggingface.co/{REPO}/resolve/main"
+          INDEX_URL = f"{BASE}/model.safetensors.index.json"
 
-          def fetch_range(url, start, end):
-              req = urllib.request.Request(
-                  url,
-                  headers={
-                      "Range": f"bytes={start}-{end}",
-                      "Accept-Encoding": "identity",
-                      "User-Agent": "Numbat-Forensics/2.0"
-                  }
-              )
-              with urllib.request.urlopen(req, timeout=180) as r:
-                  if r.status != 206:
-                      raise RuntimeError(f"HTTP {r.status}")
-                  cr = r.headers.get("Content-Range", "")
-                  if not cr.startswith(f"bytes {start}-{end}/"):
-                      raise RuntimeError(f"Bad Content-Range: {cr}")
-                  data = r.read()
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              "User-Agent": "Numbat-Forensic-Scanner/2.0"
+          })
 
-              if len(data) != end - start + 1:
-                  raise RuntimeError("Incomplete range")
-              return data
+          LOG = []
+          RESULTS = []
+          HEADER_CACHE = {}
+          FILE_URL_CACHE = {}
 
-          def fetch_json(url):
-              req = urllib.request.Request(
-                  url,
-                  headers={"User-Agent": "Numbat-Forensics/2.0"}
-              )
-              with urllib.request.urlopen(req, timeout=180) as r:
-                  return json.loads(r.read())
+          def log(message=""):
+              print(message, flush=True)
+              LOG.append(str(message))
 
-          def bf16_bytes(values):
-              values = np.asarray(values, dtype=np.float32)
-              bits = np.ascontiguousarray(values).view(np.uint32)
-              rounded = (
-                  bits + np.uint32(0x7FFF)
-                  + ((bits >> 16) & np.uint32(1))
-              )
-              return (rounded >> 16).astype("<u2").tobytes()
+          def get_range(url, start, end, retries=4):
+              headers = {"Range": f"bytes={start}-{end}"}
 
-          def candidate(name, shape, kind):
-              seed = int.from_bytes(
-                  hashlib.sha256(name.encode()).digest()[:8],
-                  "big"
-              )
-              rng = np.random.Generator(np.random.PCG64(seed))
-              z = rng.standard_normal(shape, dtype=np.float32)
-
-              if kind == "norm":
-                  values = np.exp(np.float32(0.06) * z)
-              else:
-                  values = z / np.float32(6.0)
-
-              return bf16_bytes(values)
-
-          print("=" * 70)
-          print("NUMBAT FULL FORENSIC SCAN")
-          print("=" * 70)
-
-          print("\nLoading model index...")
-          index = fetch_json(
-              f"{BASE}/model.safetensors.index.json"
-          )
-          weight_map = index["weight_map"]
-
-          selected = []
-
-          for name in weight_map:
-              if name.endswith("input_layernorm.weight"):
-                  selected.append((name, "norm"))
-              elif name.endswith("post_attention_layernorm.weight"):
-                  selected.append((name, "norm"))
-              elif name.endswith("self_attn.k_conv1d.weight"):
-                  selected.append((name, "conv"))
-
-          selected.sort()
-
-          # Sample up to 60 evenly distributed tensors.
-          limit = 60
-
-          if len(selected) > limit:
-              positions = np.linspace(
-                  0, len(selected) - 1, limit, dtype=int
-              )
-              selected = [selected[i] for i in positions]
-
-          print("Available candidate tensors:", len(weight_map))
-          print("Selected tensors:", len(selected))
-
-          header_cache = {}
-          results = []
-
-          for number, (name, kind) in enumerate(selected, 1):
-              try:
-                  shard = weight_map[name]
-                  url = f"{BASE}/{shard}"
-
-                  if shard not in header_cache:
-                      first = fetch_range(url, 0, 7)
-                      header_size = struct.unpack("<Q", first)[0]
-
-                      if header_size > 100 * 1024 * 1024:
-                          raise RuntimeError("Header too large")
-
-                      header_bytes = fetch_range(
-                          url, 8, 7 + header_size
+              for attempt in range(retries):
+                  try:
+                      response = SESSION.get(
+                          url,
+                          headers=headers,
+                          timeout=90,
+                          stream=True
                       )
-                      header_cache[shard] = json.loads(header_bytes)
 
-                  header = header_cache[shard]
-                  meta = header[name]
+                      if response.status_code != 206:
+                          status = response.status_code
+                          response.close()
+                          raise RuntimeError(
+                              f"Expected HTTP 206, got {status}"
+                          )
 
-                  if meta["dtype"] != "BF16":
-                      print(f"[SKIP] {name}: {meta['dtype']}")
-                      continue
+                      content_range = response.headers.get(
+                          "Content-Range", ""
+                      )
 
-                  shape = meta["shape"]
-                  offsets = meta["data_offsets"]
+                      expected = f"bytes {start}-{end}/"
 
-                  start = 8 + header_size if False else None
-                  # Header size is encoded in the first 8 bytes.
-                  header_size = struct.unpack(
-                      "<Q", fetch_range(url, 0, 7)
-                  )[0]
+                      if not content_range.startswith(expected):
+                          response.close()
+                          raise RuntimeError(
+                              f"Invalid Content-Range: {content_range}"
+                          )
 
-                  data_start = 8 + header_size + offsets[0]
-                  data_end = 8 + header_size + offsets[1] - 1
+                      data = response.content
+                      response.close()
 
-                  actual = fetch_range(url, data_start, data_end)
-                  expected = candidate(name, shape, kind)
+                      if len(data) != end - start + 1:
+                          raise RuntimeError(
+                              f"Wrong range length: {len(data)}"
+                          )
 
-                  matched = actual == expected
+                      return data
 
-                  results.append((name, matched, len(actual)))
+                  except Exception:
+                      if attempt == retries - 1:
+                          raise
+                      time.sleep(2 * (attempt + 1))
 
-                  status = "EXACT MATCH" if matched else "NO MATCH"
-                  print(
-                      f"[{number}/{len(selected)}] {status}: "
-                      f"{name} ({len(actual):,} bytes)",
-                      flush=True
+          def get_file_url(filename):
+              if filename not in FILE_URL_CACHE:
+                  FILE_URL_CACHE[filename] = (
+                      f"{BASE}/{filename}"
+                  )
+              return FILE_URL_CACHE[filename]
+
+          def get_header(filename):
+              if filename in HEADER_CACHE:
+                  return HEADER_CACHE[filename]
+
+              url = get_file_url(filename)
+
+              first = get_range(url, 0, 7)
+              header_size = struct.unpack("<Q", first)[0]
+
+              if header_size <= 0 or header_size > 100_000_000:
+                  raise RuntimeError(
+                      f"Suspicious safetensors header size: {header_size}"
                   )
 
-              except Exception as exc:
-                  print(f"[ERROR] {name}: {exc}", flush=True)
-                  results.append((name, None, 0))
-
-          matches = sum(x[1] is True for x in results)
-          mismatches = sum(x[1] is False for x in results)
-          errors = sum(x[1] is None for x in results)
-
-          print("\n" + "=" * 70)
-          print("FINAL FORENSIC REPORT")
-          print("=" * 70)
-          print("Tested:", len(results))
-          print("Exact matches:", matches)
-          print("Mismatches:", mismatches)
-          print("Errors:", errors)
-
-          if results:
-              print(
-                  "Match percentage:",
-                  f"{matches / len(results) * 100:.2f}%"
+              raw_header = get_range(
+                  url,
+                  8,
+                  8 + header_size - 1
               )
 
-          if matches == len(results) and results:
-              print("VERDICT: ALL TESTED TENSORS MATCH")
-          elif matches > 0:
-              print("VERDICT: PARTIAL SEEDED-RNG EVIDENCE")
-          else:
-              print("VERDICT: RECIPE NOT CONFIRMED")
+              header = json.loads(raw_header)
 
-          print("\nThis scan does not authenticate every model tensor.")
+              HEADER_CACHE[filename] = (
+                  header_size,
+                  header
+              )
+
+              return header_size, header
+
+          def fetch_tensor(filename, tensor_name):
+              header_size, header = get_header(filename)
+
+              if tensor_name not in header:
+                  raise KeyError(
+                      f"{tensor_name} missing from shard header"
+                  )
+
+              info = header[tensor_name]
+
+              if info.get("dtype") != "BF16":
+                  raise RuntimeError(
+                      f"Expected BF16, got {info.get('dtype')}"
+                  )
+
+              shape = tuple(info["shape"])
+              begin, end = info["data_offsets"]
+
+              absolute_start = 8 + header_size + begin
+              absolute_end = 8 + header_size + end - 1
+
+              raw = get_range(
+                  get_file_url(filename),
+                  absolute_start,
+                  absolute_end
+              )
+
+              return raw, shape
+
+          def seed_for(name, endian="big"):
+              digest = hashlib.sha256(
+                  name.encode("utf-8")
+              ).digest()
+
+              return int.from_bytes(
+                  digest[:8],
+                  endian
+              )
+
+          def to_bf16_bytes(array):
+              array = np.asarray(array, dtype=np.float32)
+              bits = array.view(np.uint32)
+
+              rounding = (
+                  ((bits >> 16) & 1) + 0x7FFF
+              )
+
+              rounded = (
+                  (bits + rounding) >> 16
+              ).astype("<u2")
+
+              return rounded.tobytes()
+
+          def generate_candidate(
+              name,
+              shape,
+              endian="big",
+              precision="float32"
+          ):
+              seed = seed_for(name, endian)
+
+              rng = np.random.Generator(
+                  np.random.PCG64(seed)
+              )
+
+              if precision == "float32":
+                  z = rng.standard_normal(
+                      shape,
+                      dtype=np.float32
+                  )
+              else:
+                  z = rng.standard_normal(
+                      shape,
+                      dtype=np.float64
+                  ).astype(np.float32)
+
+              if name.endswith(
+                  ("input_layernorm.weight",
+                   "post_attention_layernorm.weight")
+              ):
+                  values = np.exp(
+                      np.float32(0.06) * z
+                  )
+
+              elif name.endswith(
+                  "self_attn.k_conv1d.weight"
+              ):
+                  values = z / np.float32(6.0)
+
+              else:
+                  raise ValueError(
+                      f"Unsupported tensor: {name}"
+                  )
+
+              return to_bf16_bytes(values)
+
+          def tensor_type(name):
+              if name.endswith("input_layernorm.weight"):
+                  return "input_layernorm"
+
+              if name.endswith("post_attention_layernorm.weight"):
+                  return "post_attention_layernorm"
+
+              if name.endswith("self_attn.k_conv1d.weight"):
+                  return "k_conv1d"
+
+              return "other"
+
+          def investigate_mismatch(name, shape, actual):
+              variants = [
+                  ("little-endian-seed/float32", "little", "float32"),
+                  ("big-endian-seed/float64", "big", "float64"),
+                  ("little-endian-seed/float64", "little", "float64"),
+              ]
+
+              matches = []
+
+              for label, endian, precision in variants:
+                  candidate = generate_candidate(
+                      name,
+                      shape,
+                      endian=endian,
+                      precision=precision
+                  )
+
+                  if candidate == actual:
+                      matches.append(label)
+
+              return matches
+
+          def main():
+              log("=" * 72)
+              log("NUMBAT COMPLETE FORENSIC SCAN")
+              log("=" * 72)
+              log(f"Repository: {REPO}")
+              log("Method: SHA256 tensor-name seed + PCG64")
+              log("Primary: big-endian seed, float32")
+              log()
+
+              log("Downloading model index...")
+
+              response = SESSION.get(
+                  INDEX_URL,
+                  timeout=120
+              )
+              response.raise_for_status()
+
+              index = response.json()
+              weight_map = index["weight_map"]
+
+              log(
+                  f"Total tensor mappings: {len(weight_map):,}"
+              )
+
+              suffixes = (
+                  "input_layernorm.weight",
+                  "post_attention_layernorm.weight",
+                  "self_attn.k_conv1d.weight",
+              )
+
+              selected = sorted(
+                  name for name in weight_map
+                  if name.endswith(suffixes)
+              )
+
+              log(
+                  f"Selected tensors: {len(selected)}"
+              )
+
+              counts = Counter(
+                  tensor_type(name) for name in selected
+              )
+
+              for kind, count in sorted(counts.items()):
+                  log(f"  {kind}: {count}")
+
+              log()
+              log("Starting tensor-by-tensor scan...")
+              log()
+
+              exact = 0
+              mismatches = 0
+              errors = 0
+              alternate_matches = 0
+
+              for number, name in enumerate(selected, 1):
+                  shard = weight_map[name]
+                  kind = tensor_type(name)
+
+                  try:
+                      actual, shape = fetch_tensor(
+                          shard,
+                          name
+                      )
+
+                      expected_bytes = (
+                          int(np.prod(shape)) * 2
+                      )
+
+                      if len(actual) != expected_bytes:
+                          raise RuntimeError(
+                              f"Unexpected byte count: "
+                              f"{len(actual)} != {expected_bytes}"
+                          )
+
+                      candidate = generate_candidate(
+                          name,
+                          shape
+                      )
+
+                      if candidate == actual:
+                          exact += 1
+                          status = "EXACT MATCH"
+                          detail = ""
+
+                      else:
+                          mismatches += 1
+
+                          alternatives = investigate_mismatch(
+                              name,
+                              shape,
+                              actual
+                          )
+
+                          if alternatives:
+                              alternate_matches += 1
+                              status = "ALTERNATE MATCH"
+                              detail = "; ".join(alternatives)
+                          else:
+                              status = "NO MATCH"
+                              detail = ""
+
+                      result = {
+                          "name": name,
+                          "shard": shard,
+                          "type": kind,
+                          "shape": list(shape),
+                          "bytes": len(actual),
+                          "status": status,
+                          "detail": detail,
+                      }
+
+                      RESULTS.append(result)
+
+                      suffix = (
+                          f" ({detail})" if detail else ""
+                      )
+
+                      log(
+                          f"[{number}/{len(selected)}] "
+                          f"{status}: {name} "
+                          f"{shape}{suffix}"
+                      )
+
+                  except Exception as exc:
+                      errors += 1
+
+                      RESULTS.append({
+                          "name": name,
+                          "shard": shard,
+                          "type": kind,
+                          "status": "ERROR",
+                          "detail": str(exc),
+                      })
+
+                      log(
+                          f"[{number}/{len(selected)}] "
+                          f"ERROR: {name}: {exc}"
+                      )
+
+              tested = exact + mismatches
+
+              log()
+              log("=" * 72)
+              log("FINAL FORENSIC REPORT")
+              log("=" * 72)
+              log(f"Selected: {len(selected)}")
+              log(f"Tested: {tested}")
+              log(f"Exact primary matches: {exact}")
+              log(f"Primary mismatches: {mismatches}")
+              log(f"Alternate matches: {alternate_matches}")
+              log(f"Errors: {errors}")
+
+              if tested:
+                  percentage = exact / tested * 100
+                  log(
+                      f"Primary match percentage: "
+                      f"{percentage:.2f}%"
+                  )
+
+              log()
+              log("RESULTS BY TENSOR TYPE")
+
+              for kind in sorted(counts):
+                  group = [
+                      item for item in RESULTS
+                      if item["type"] == kind
+                  ]
+
+                  group_exact = sum(
+                      item["status"] == "EXACT MATCH"
+                      for item in group
+                  )
+
+                  group_alt = sum(
+                      item["status"] == "ALTERNATE MATCH"
+                      for item in group
+                  )
+
+                  group_errors = sum(
+                      item["status"] == "ERROR"
+                      for item in group
+                  )
+
+                  log(
+                      f"{kind}: "
+                      f"{group_exact}/{len(group)} primary, "
+                      f"{group_alt} alternate, "
+                      f"{group_errors} errors"
+                  )
+
+              log()
+              log("MISMATCH DETAILS")
+
+              for item in RESULTS:
+                  if item["status"] in (
+                      "NO MATCH",
+                      "ALTERNATE MATCH",
+                      "ERROR"
+                  ):
+                      log(
+                          f"{item['status']}: "
+                          f"{item['name']} "
+                          f"{item.get('detail', '')}"
+                      )
+
+              log()
+              log(
+                  "IMPORTANT: This scan tests only the selected "
+                  "tensor families."
+              )
+              log(
+                  "A match demonstrates byte-level agreement with "
+                  "the tested deterministic recipe."
+              )
+              log(
+                  "It does not authenticate or classify every "
+                  "weight in the model."
+              )
+
+              Path("numbat-forensics-full.log").write_text(
+                  "\n".join(LOG) + "\n",
+                  encoding="utf-8"
+              )
+
+              with open(
+                  "numbat-forensics-full.csv",
+                  "w",
+                  newline="",
+                  encoding="utf-8"
+              ) as file:
+                  if RESULTS:
+                      writer = csv.DictWriter(
+                          file,
+                          fieldnames=sorted({
+                              key
+                              for item in RESULTS
+                              for key in item
+                          })
+                      )
+                      writer.writeheader()
+                      writer.writerows(RESULTS)
+
+              report = {
+                  "repository": REPO,
+                  "selected": len(selected),
+                  "tested": tested,
+                  "exact_primary_matches": exact,
+                  "primary_mismatches": mismatches,
+                  "alternate_matches": alternate_matches,
+                  "errors": errors,
+                  "primary_match_percentage": (
+                      exact / tested * 100 if tested else None
+                  ),
+                  "by_type": dict(counts),
+                  "results": RESULTS,
+              }
+
+              Path("numbat-forensics-full.json").write_text(
+                  json.dumps(
+                      report,
+                      indent=2,
+                      ensure_ascii=False
+                  ),
+                  encoding="utf-8"
+              )
+
+              log()
+              log("Reports saved.")
+
+              if errors:
+                  log(
+                      "WARNING: Some tensors could not be tested."
+                  )
+
+          if __name__ == "__main__":
+              main()
           PY
 
-          cat numbat-forensics.log
+          python -u numbat_full_scan.py 2>&1 | tee numbat-run.log
 
-      - name: Upload forensic report
+      - name: Upload forensic reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: numbat-full-forensic-report
-          path: numbat-forensics.log
-          retention-days: 7
+          name: numbat-complete-forensic-report
+          path: |
+            numbat-forensics-full.log
+            numbat-forensics-full.csv
+            numbat-forensics-full.json
+            numbat-run.log
+          if-no-files-found: warn
+          retention-days: 30
