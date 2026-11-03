@@ -1,4 +1,4 @@
-name: Numbat Forensic Verification
+name: Numbat Full Forensic Scan
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  forensic:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Set up Python
@@ -20,7 +20,7 @@ jobs:
       - name: Install NumPy
         run: python -m pip install numpy
 
-      - name: Verify tensor fingerprints
+      - name: Scan model tensors
         shell: bash
         run: |
           python - <<'PY' > numbat-forensics.log 2>&1
@@ -33,210 +33,176 @@ jobs:
           REPO = "burner22/numbat"
           BASE = f"https://huggingface.co/{REPO}/resolve/main"
 
-          TARGETS = {
-              "model.layers.0.input_layernorm.weight": "norm",
-              "model.layers.0.self_attn.k_conv1d.weight": "conv"
-          }
-
-          def fetch(url):
-              req = urllib.request.Request(
-                  url,
-                  headers={"User-Agent": "Numbat-Forensics/1.0"}
-              )
-              with urllib.request.urlopen(req, timeout=180) as r:
-                  return r.read()
-
           def fetch_range(url, start, end):
               req = urllib.request.Request(
                   url,
                   headers={
                       "Range": f"bytes={start}-{end}",
                       "Accept-Encoding": "identity",
-                      "User-Agent": "Numbat-Forensics/1.0"
+                      "User-Agent": "Numbat-Forensics/2.0"
                   }
               )
-
               with urllib.request.urlopen(req, timeout=180) as r:
                   if r.status != 206:
-                      raise RuntimeError(
-                          f"Expected HTTP 206, received {r.status}"
-                      )
-
-                  content_range = r.headers.get("Content-Range", "")
-                  if not content_range.startswith(
-                      f"bytes {start}-{end}/"
-                  ):
-                      raise RuntimeError(
-                          f"Unexpected Content-Range: {content_range}"
-                      )
-
+                      raise RuntimeError(f"HTTP {r.status}")
+                  cr = r.headers.get("Content-Range", "")
+                  if not cr.startswith(f"bytes {start}-{end}/"):
+                      raise RuntimeError(f"Bad Content-Range: {cr}")
                   data = r.read()
 
               if len(data) != end - start + 1:
-                  raise RuntimeError("Incomplete range response")
-
+                  raise RuntimeError("Incomplete range")
               return data
 
-          def to_bf16_bytes(values):
+          def fetch_json(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Numbat-Forensics/2.0"}
+              )
+              with urllib.request.urlopen(req, timeout=180) as r:
+                  return json.loads(r.read())
+
+          def bf16_bytes(values):
               values = np.asarray(values, dtype=np.float32)
-              values = np.ascontiguousarray(values)
-
-              bits = values.view(np.uint32)
-
+              bits = np.ascontiguousarray(values).view(np.uint32)
               rounded = (
-                  bits
-                  + np.uint32(0x7FFF)
+                  bits + np.uint32(0x7FFF)
                   + ((bits >> 16) & np.uint32(1))
               )
+              return (rounded >> 16).astype("<u2").tobytes()
 
-              result = (rounded >> 16).astype("<u2")
-              return result.tobytes()
-
-          def generate_candidate(name, shape, kind, endian, rng_dtype):
-              digest = hashlib.sha256(name.encode()).digest()
-              seed = int.from_bytes(digest[:8], endian)
-
+          def candidate(name, shape, kind):
+              seed = int.from_bytes(
+                  hashlib.sha256(name.encode()).digest()[:8],
+                  "big"
+              )
               rng = np.random.Generator(np.random.PCG64(seed))
-
-              if rng_dtype == "float32":
-                  z = rng.standard_normal(
-                      shape, dtype=np.float32
-                  )
-              else:
-                  z = rng.standard_normal(shape)
+              z = rng.standard_normal(shape, dtype=np.float32)
 
               if kind == "norm":
-                  values = np.exp(0.06 * z)
+                  values = np.exp(np.float32(0.06) * z)
               else:
-                  values = z / 6.0
+                  values = z / np.float32(6.0)
 
-              return to_bf16_bytes(values)
+              return bf16_bytes(values)
 
-          def inspect_tensor(name, kind, index):
-              print("\n" + "=" * 65)
-              print("TENSOR:", name)
-              print("=" * 65)
+          print("=" * 70)
+          print("NUMBAT FULL FORENSIC SCAN")
+          print("=" * 70)
 
-              shard = index["weight_map"].get(name)
-
-              if not shard:
-                  raise RuntimeError("Tensor absent from index")
-
-              print("Shard:", shard)
-
-              url = f"{BASE}/{shard}"
-
-              first = fetch_range(url, 0, 7)
-              header_size = struct.unpack("<Q", first)[0]
-
-              if header_size > 100 * 1024 * 1024:
-                  raise RuntimeError("Unexpected header size")
-
-              header_bytes = fetch_range(
-                  url, 8, 7 + header_size
-              )
-
-              header = json.loads(header_bytes)
-
-              if name not in header:
-                  raise RuntimeError("Tensor absent from shard header")
-
-              meta = header[name]
-              dtype = meta["dtype"]
-              shape = meta["shape"]
-              offsets = meta["data_offsets"]
-
-              print("Dtype:", dtype)
-              print("Shape:", shape)
-
-              if dtype != "BF16":
-                  print("UNSUPPORTED DTYPE: expected BF16")
-                  return False
-
-              start = 8 + header_size + offsets[0]
-              end = 8 + header_size + offsets[1] - 1
-
-              actual = fetch_range(url, start, end)
-
-              expected_size = int(np.prod(shape)) * 2
-
-              if len(actual) != expected_size:
-                  raise RuntimeError("Unexpected tensor byte count")
-
-              print("Actual bytes:", len(actual))
-
-              matches = []
-
-              for endian in ("little", "big"):
-                  for rng_dtype in ("float64", "float32"):
-                      candidate = generate_candidate(
-                          name,
-                          shape,
-                          kind,
-                          endian,
-                          rng_dtype
-                      )
-
-                      exact = candidate == actual
-
-                      print(
-                          f"Seed={endian}, RNG={rng_dtype}: "
-                          f"{'EXACT MATCH' if exact else 'NO MATCH'}"
-                      )
-
-                      if exact:
-                          matches.append((endian, rng_dtype))
-
-              if matches:
-                  print("RESULT: EXACT SEEDED-RNG MATCH")
-                  print("Matching variants:", matches)
-                  return True
-
-              print("RESULT: NO EXACT MATCH")
-              return False
-
-          print("=" * 65)
-          print("NUMBAT FORENSIC VERIFICATION")
-          print("No repository Python code will be executed.")
-          print("Only two selected tensor ranges will be downloaded.")
-          print("=" * 65)
-
-          print("\nDownloading tensor index...")
-          index = json.loads(
-              fetch(f"{BASE}/model.safetensors.index.json")
+          print("\nLoading model index...")
+          index = fetch_json(
+              f"{BASE}/model.safetensors.index.json"
           )
+          weight_map = index["weight_map"]
 
-          print("Index entries:", len(index["weight_map"]))
+          selected = []
 
-          results = {}
+          for name in weight_map:
+              if name.endswith("input_layernorm.weight"):
+                  selected.append((name, "norm"))
+              elif name.endswith("post_attention_layernorm.weight"):
+                  selected.append((name, "norm"))
+              elif name.endswith("self_attn.k_conv1d.weight"):
+                  selected.append((name, "conv"))
 
-          for name, kind in TARGETS.items():
-              results[name] = inspect_tensor(
-                  name, kind, index
+          selected.sort()
+
+          # Sample up to 60 evenly distributed tensors.
+          limit = 60
+
+          if len(selected) > limit:
+              positions = np.linspace(
+                  0, len(selected) - 1, limit, dtype=int
               )
+              selected = [selected[i] for i in positions]
 
-          print("\n" + "=" * 65)
-          print("FINAL FORENSIC RESULT")
-          print("=" * 65)
+          print("Available candidate tensors:", len(weight_map))
+          print("Selected tensors:", len(selected))
 
-          for name, matched in results.items():
+          header_cache = {}
+          results = []
+
+          for number, (name, kind) in enumerate(selected, 1):
+              try:
+                  shard = weight_map[name]
+                  url = f"{BASE}/{shard}"
+
+                  if shard not in header_cache:
+                      first = fetch_range(url, 0, 7)
+                      header_size = struct.unpack("<Q", first)[0]
+
+                      if header_size > 100 * 1024 * 1024:
+                          raise RuntimeError("Header too large")
+
+                      header_bytes = fetch_range(
+                          url, 8, 7 + header_size
+                      )
+                      header_cache[shard] = json.loads(header_bytes)
+
+                  header = header_cache[shard]
+                  meta = header[name]
+
+                  if meta["dtype"] != "BF16":
+                      print(f"[SKIP] {name}: {meta['dtype']}")
+                      continue
+
+                  shape = meta["shape"]
+                  offsets = meta["data_offsets"]
+
+                  start = 8 + header_size if False else None
+                  # Header size is encoded in the first 8 bytes.
+                  header_size = struct.unpack(
+                      "<Q", fetch_range(url, 0, 7)
+                  )[0]
+
+                  data_start = 8 + header_size + offsets[0]
+                  data_end = 8 + header_size + offsets[1] - 1
+
+                  actual = fetch_range(url, data_start, data_end)
+                  expected = candidate(name, shape, kind)
+
+                  matched = actual == expected
+
+                  results.append((name, matched, len(actual)))
+
+                  status = "EXACT MATCH" if matched else "NO MATCH"
+                  print(
+                      f"[{number}/{len(selected)}] {status}: "
+                      f"{name} ({len(actual):,} bytes)",
+                      flush=True
+                  )
+
+              except Exception as exc:
+                  print(f"[ERROR] {name}: {exc}", flush=True)
+                  results.append((name, None, 0))
+
+          matches = sum(x[1] is True for x in results)
+          mismatches = sum(x[1] is False for x in results)
+          errors = sum(x[1] is None for x in results)
+
+          print("\n" + "=" * 70)
+          print("FINAL FORENSIC REPORT")
+          print("=" * 70)
+          print("Tested:", len(results))
+          print("Exact matches:", matches)
+          print("Mismatches:", mismatches)
+          print("Errors:", errors)
+
+          if results:
               print(
-                  ("MATCH: " if matched else "NO MATCH: ") + name
+                  "Match percentage:",
+                  f"{matches / len(results) * 100:.2f}%"
               )
 
-          count = sum(results.values())
-
-          print(f"\nExact matches: {count}/{len(results)}")
-
-          if count == len(results):
-              print("VERDICT: BOTH SAMPLES MATCH SEEDED RANDOM DATA")
-          elif count:
+          if matches == len(results) and results:
+              print("VERDICT: ALL TESTED TENSORS MATCH")
+          elif matches > 0:
               print("VERDICT: PARTIAL SEEDED-RNG EVIDENCE")
           else:
-              print("VERDICT: REPORTED RECIPE NOT CONFIRMED")
+              print("VERDICT: RECIPE NOT CONFIRMED")
 
-          print("\nThis is a two-tensor test, not a complete")
-          print("authentication of the entire checkpoint.")
+          print("\nThis scan does not authenticate every model tensor.")
           PY
 
           cat numbat-forensics.log
@@ -245,6 +211,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: numbat-forensic-report
+          name: numbat-full-forensic-report
           path: numbat-forensics.log
           retention-days: 7
