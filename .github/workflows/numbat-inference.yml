@@ -24,7 +24,7 @@ jobs:
 
     env:
       MODEL_ID: burner22/numbat
-      HF_HOME: ${{ runner.temp }}/numbat-hf-cache
+      HF_HOME: ${{ github.workspace }}/.numbat-hf-cache
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       USER_PROMPT: ${{ inputs.prompt }}
 
