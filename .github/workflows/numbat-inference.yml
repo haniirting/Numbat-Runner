@@ -1,567 +1,214 @@
 
-name: Numbat Full Forensic Scan
+name: Numbat Runner - Real Inference
 
 on:
   workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Сообщение для Numbat"
+        required: true
+        type: string
+        default: "Привет! Расскажи, кто ты и что умеешь."
 
 permissions:
   contents: read
 
+concurrency:
+  group: numbat-inference
+  cancel-in-progress: false
+
 jobs:
-  forensic-scan:
+  numbat:
+    name: Numbat Inference
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 20
+
+    env:
+      MODEL_ID: burner22/numbat
+      HF_HOME: ${{ runner.temp }}/numbat-hf-cache
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      USER_PROMPT: ${{ inputs.prompt }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy requests
+          pip install "huggingface_hub>=0.34.0"
 
-      - name: Run complete forensic scan
-        env:
-          PYTHONUNBUFFERED: "1"
+      - name: Download metadata and attempt real inference
+        id: inference
+        continue-on-error: true
         run: |
-          cat > numbat_full_scan.py <<'PY'
-          import hashlib
+          python - <<'PY'
+          import os
+          import sys
           import json
-          import struct
-          import csv
-          import time
-          from collections import Counter
+          import shutil
+          import traceback
           from pathlib import Path
+          from huggingface_hub import HfApi, hf_hub_download, InferenceClient
 
-          import numpy as np
-          import requests
+          MODEL = os.environ["MODEL_ID"]
+          PROMPT = os.environ["USER_PROMPT"]
+          CACHE = os.environ["HF_HOME"]
 
-          REPO = "burner22/numbat"
-          BASE = f"https://huggingface.co/{REPO}/resolve/main"
-          INDEX_URL = f"{BASE}/model.safetensors.index.json"
+          print("=" * 65)
+          print("NUMBAT RUNNER")
+          print("Model:", MODEL)
+          print("=" * 65)
 
-          SESSION = requests.Session()
-          SESSION.headers.update({
-              "User-Agent": "Numbat-Forensic-Scanner/2.0"
-          })
+          result = "NOT_STARTED"
+          details = []
 
-          LOG = []
-          RESULTS = []
-          HEADER_CACHE = {}
-          FILE_URL_CACHE = {}
+          def report(text):
+              print(text, flush=True)
+              details.append(text)
 
-          def log(message=""):
-              print(message, flush=True)
-              LOG.append(str(message))
+          try:
+              disk = shutil.disk_usage(os.environ["RUNNER_TEMP"])
 
-          def get_range(url, start, end, retries=4):
-              headers = {"Range": f"bytes={start}-{end}"}
+              memory = 0
+              try:
+                  with open("/proc/meminfo") as f:
+                      for line in f:
+                          if line.startswith("MemTotal:"):
+                              memory = int(line.split()[1]) * 1024
+                              break
+              except Exception:
+                  pass
 
-              for attempt in range(retries):
-                  try:
-                      response = SESSION.get(
-                          url,
-                          headers=headers,
-                          timeout=90,
-                          stream=True
-                      )
+              report(f"Available disk: {disk.free / 1024**3:.2f} GB")
+              report(f"Total RAM: {memory / 1024**3:.2f} GB")
 
-                      if response.status_code != 206:
-                          status = response.status_code
-                          response.close()
-                          raise RuntimeError(
-                              f"Expected HTTP 206, got {status}"
-                          )
+              report("Connecting to Hugging Face...")
+              api = HfApi(token=os.getenv("HF_TOKEN") or None)
+              info = api.model_info(MODEL, files_metadata=True)
 
-                      content_range = response.headers.get(
-                          "Content-Range", ""
-                      )
+              report("Hugging Face repository found.")
+              report(f"Revision: {info.sha}")
 
-                      expected = f"bytes {start}-{end}/"
+              report("Downloading original model metadata...")
 
-                      if not content_range.startswith(expected):
-                          response.close()
-                          raise RuntimeError(
-                              f"Invalid Content-Range: {content_range}"
-                          )
-
-                      data = response.content
-                      response.close()
-
-                      if len(data) != end - start + 1:
-                          raise RuntimeError(
-                              f"Wrong range length: {len(data)}"
-                          )
-
-                      return data
-
-                  except Exception:
-                      if attempt == retries - 1:
-                          raise
-                      time.sleep(2 * (attempt + 1))
-
-          def get_file_url(filename):
-              if filename not in FILE_URL_CACHE:
-                  FILE_URL_CACHE[filename] = (
-                      f"{BASE}/{filename}"
-                  )
-              return FILE_URL_CACHE[filename]
-
-          def get_header(filename):
-              if filename in HEADER_CACHE:
-                  return HEADER_CACHE[filename]
-
-              url = get_file_url(filename)
-
-              first = get_range(url, 0, 7)
-              header_size = struct.unpack("<Q", first)[0]
-
-              if header_size <= 0 or header_size > 100_000_000:
-                  raise RuntimeError(
-                      f"Suspicious safetensors header size: {header_size}"
-                  )
-
-              raw_header = get_range(
-                  url,
-                  8,
-                  8 + header_size - 1
+              config_path = hf_hub_download(
+                  repo_id=MODEL,
+                  filename="config.json",
+                  cache_dir=CACHE
               )
 
-              header = json.loads(raw_header)
-
-              HEADER_CACHE[filename] = (
-                  header_size,
-                  header
+              index_path = hf_hub_download(
+                  repo_id=MODEL,
+                  filename="model.safetensors.index.json",
+                  cache_dir=CACHE
               )
 
-              return header_size, header
-
-          def fetch_tensor(filename, tensor_name):
-              header_size, header = get_header(filename)
-
-              if tensor_name not in header:
-                  raise KeyError(
-                      f"{tensor_name} missing from shard header"
-                  )
-
-              info = header[tensor_name]
-
-              if info.get("dtype") != "BF16":
-                  raise RuntimeError(
-                      f"Expected BF16, got {info.get('dtype')}"
-                  )
-
-              shape = tuple(info["shape"])
-              begin, end = info["data_offsets"]
-
-              absolute_start = 8 + header_size + begin
-              absolute_end = 8 + header_size + end - 1
-
-              raw = get_range(
-                  get_file_url(filename),
-                  absolute_start,
-                  absolute_end
+              tokenizer_path = hf_hub_download(
+                  repo_id=MODEL,
+                  filename="tokenizer.json",
+                  cache_dir=CACHE
               )
 
-              return raw, shape
+              with open(config_path, encoding="utf-8") as f:
+                  config = json.load(f)
 
-          def seed_for(name, endian="big"):
-              digest = hashlib.sha256(
-                  name.encode("utf-8")
-              ).digest()
+              with open(index_path, encoding="utf-8") as f:
+                  index = json.load(f)
 
-              return int.from_bytes(
-                  digest[:8],
-                  endian
+              required = index.get("metadata", {}).get("total_size", 0)
+
+              report("Original configuration downloaded.")
+              report("Original tokenizer downloaded.")
+              report("Original tensor index downloaded.")
+              report(f"Model architecture: {config.get('architectures')}")
+              report(f"Model type: {config.get('model_type')}")
+              report(f"Tensor mappings: {len(index.get('weight_map', {})):,}")
+              report(f"Declared weight size: {required:,} bytes")
+              report(f"Declared weight size: {required / 1024**4:.2f} TB")
+
+              if required:
+                  disk_ok = required < disk.free * 0.8
+                  memory_ok = required < memory * 0.65
+
+                  report(f"Full local download fits disk: {disk_ok}")
+                  report(f"Full local load fits RAM: {memory_ok}")
+
+              report("")
+              report("ATTEMPTING REAL HUGGING FACE INFERENCE...")
+              report("Sending user prompt to the original model endpoint.")
+
+              client = InferenceClient(
+                  model=MODEL,
+                  provider="auto",
+                  token=os.getenv("HF_TOKEN") or None,
+                  timeout=90
               )
 
-          def to_bf16_bytes(array):
-              array = np.asarray(array, dtype=np.float32)
-              bits = array.view(np.uint32)
-
-              rounding = (
-                  ((bits >> 16) & 1) + 0x7FFF
-              )
-
-              rounded = (
-                  (bits + rounding) >> 16
-              ).astype("<u2")
-
-              return rounded.tobytes()
-
-          def generate_candidate(
-              name,
-              shape,
-              endian="big",
-              precision="float32"
-          ):
-              seed = seed_for(name, endian)
-
-              rng = np.random.Generator(
-                  np.random.PCG64(seed)
-              )
-
-              if precision == "float32":
-                  z = rng.standard_normal(
-                      shape,
-                      dtype=np.float32
-                  )
-              else:
-                  z = rng.standard_normal(
-                      shape,
-                      dtype=np.float64
-                  ).astype(np.float32)
-
-              if name.endswith(
-                  ("input_layernorm.weight",
-                   "post_attention_layernorm.weight")
-              ):
-                  values = np.exp(
-                      np.float32(0.06) * z
-                  )
-
-              elif name.endswith(
-                  "self_attn.k_conv1d.weight"
-              ):
-                  values = z / np.float32(6.0)
-
-              else:
-                  raise ValueError(
-                      f"Unsupported tensor: {name}"
-                  )
-
-              return to_bf16_bytes(values)
-
-          def tensor_type(name):
-              if name.endswith("input_layernorm.weight"):
-                  return "input_layernorm"
-
-              if name.endswith("post_attention_layernorm.weight"):
-                  return "post_attention_layernorm"
-
-              if name.endswith("self_attn.k_conv1d.weight"):
-                  return "k_conv1d"
-
-              return "other"
-
-          def investigate_mismatch(name, shape, actual):
-              variants = [
-                  ("little-endian-seed/float32", "little", "float32"),
-                  ("big-endian-seed/float64", "big", "float64"),
-                  ("little-endian-seed/float64", "little", "float64"),
-              ]
-
-              matches = []
-
-              for label, endian, precision in variants:
-                  candidate = generate_candidate(
-                      name,
-                      shape,
-                      endian=endian,
-                      precision=precision
-                  )
-
-                  if candidate == actual:
-                      matches.append(label)
-
-              return matches
-
-          def main():
-              log("=" * 72)
-              log("NUMBAT COMPLETE FORENSIC SCAN")
-              log("=" * 72)
-              log(f"Repository: {REPO}")
-              log("Method: SHA256 tensor-name seed + PCG64")
-              log("Primary: big-endian seed, float32")
-              log()
-
-              log("Downloading model index...")
-
-              response = SESSION.get(
-                  INDEX_URL,
-                  timeout=120
-              )
-              response.raise_for_status()
-
-              index = response.json()
-              weight_map = index["weight_map"]
-
-              log(
-                  f"Total tensor mappings: {len(weight_map):,}"
-              )
-
-              suffixes = (
-                  "input_layernorm.weight",
-                  "post_attention_layernorm.weight",
-                  "self_attn.k_conv1d.weight",
-              )
-
-              selected = sorted(
-                  name for name in weight_map
-                  if name.endswith(suffixes)
-              )
-
-              log(
-                  f"Selected tensors: {len(selected)}"
-              )
-
-              counts = Counter(
-                  tensor_type(name) for name in selected
-              )
-
-              for kind, count in sorted(counts.items()):
-                  log(f"  {kind}: {count}")
-
-              log()
-              log("Starting tensor-by-tensor scan...")
-              log()
-
-              exact = 0
-              mismatches = 0
-              errors = 0
-              alternate_matches = 0
-
-              for number, name in enumerate(selected, 1):
-                  shard = weight_map[name]
-                  kind = tensor_type(name)
-
-                  try:
-                      actual, shape = fetch_tensor(
-                          shard,
-                          name
-                      )
-
-                      expected_bytes = (
-                          int(np.prod(shape)) * 2
-                      )
-
-                      if len(actual) != expected_bytes:
-                          raise RuntimeError(
-                              f"Unexpected byte count: "
-                              f"{len(actual)} != {expected_bytes}"
-                          )
-
-                      candidate = generate_candidate(
-                          name,
-                          shape
-                      )
-
-                      if candidate == actual:
-                          exact += 1
-                          status = "EXACT MATCH"
-                          detail = ""
-
-                      else:
-                          mismatches += 1
-
-                          alternatives = investigate_mismatch(
-                              name,
-                              shape,
-                              actual
-                          )
-
-                          if alternatives:
-                              alternate_matches += 1
-                              status = "ALTERNATE MATCH"
-                              detail = "; ".join(alternatives)
-                          else:
-                              status = "NO MATCH"
-                              detail = ""
-
-                      result = {
-                          "name": name,
-                          "shard": shard,
-                          "type": kind,
-                          "shape": list(shape),
-                          "bytes": len(actual),
-                          "status": status,
-                          "detail": detail,
+              response = client.chat_completion(
+                  messages=[
+                      {
+                          "role": "user",
+                          "content": PROMPT
                       }
-
-                      RESULTS.append(result)
-
-                      suffix = (
-                          f" ({detail})" if detail else ""
-                      )
-
-                      log(
-                          f"[{number}/{len(selected)}] "
-                          f"{status}: {name} "
-                          f"{shape}{suffix}"
-                      )
-
-                  except Exception as exc:
-                      errors += 1
-
-                      RESULTS.append({
-                          "name": name,
-                          "shard": shard,
-                          "type": kind,
-                          "status": "ERROR",
-                          "detail": str(exc),
-                      })
-
-                      log(
-                          f"[{number}/{len(selected)}] "
-                          f"ERROR: {name}: {exc}"
-                      )
-
-              tested = exact + mismatches
-
-              log()
-              log("=" * 72)
-              log("FINAL FORENSIC REPORT")
-              log("=" * 72)
-              log(f"Selected: {len(selected)}")
-              log(f"Tested: {tested}")
-              log(f"Exact primary matches: {exact}")
-              log(f"Primary mismatches: {mismatches}")
-              log(f"Alternate matches: {alternate_matches}")
-              log(f"Errors: {errors}")
-
-              if tested:
-                  percentage = exact / tested * 100
-                  log(
-                      f"Primary match percentage: "
-                      f"{percentage:.2f}%"
-                  )
-
-              log()
-              log("RESULTS BY TENSOR TYPE")
-
-              for kind in sorted(counts):
-                  group = [
-                      item for item in RESULTS
-                      if item["type"] == kind
-                  ]
-
-                  group_exact = sum(
-                      item["status"] == "EXACT MATCH"
-                      for item in group
-                  )
-
-                  group_alt = sum(
-                      item["status"] == "ALTERNATE MATCH"
-                      for item in group
-                  )
-
-                  group_errors = sum(
-                      item["status"] == "ERROR"
-                      for item in group
-                  )
-
-                  log(
-                      f"{kind}: "
-                      f"{group_exact}/{len(group)} primary, "
-                      f"{group_alt} alternate, "
-                      f"{group_errors} errors"
-                  )
-
-              log()
-              log("MISMATCH DETAILS")
-
-              for item in RESULTS:
-                  if item["status"] in (
-                      "NO MATCH",
-                      "ALTERNATE MATCH",
-                      "ERROR"
-                  ):
-                      log(
-                          f"{item['status']}: "
-                          f"{item['name']} "
-                          f"{item.get('detail', '')}"
-                      )
-
-              log()
-              log(
-                  "IMPORTANT: This scan tests only the selected "
-                  "tensor families."
-              )
-              log(
-                  "A match demonstrates byte-level agreement with "
-                  "the tested deterministic recipe."
-              )
-              log(
-                  "It does not authenticate or classify every "
-                  "weight in the model."
+                  ],
+                  max_tokens=100,
+                  temperature=0.2
               )
 
-              Path("numbat-forensics-full.log").write_text(
-                  "\n".join(LOG) + "\n",
-                  encoding="utf-8"
-              )
+              answer = response.choices[0].message.content
 
-              with open(
-                  "numbat-forensics-full.csv",
-                  "w",
-                  newline="",
-                  encoding="utf-8"
-              ) as file:
-                  if RESULTS:
-                      writer = csv.DictWriter(
-                          file,
-                          fieldnames=sorted({
-                              key
-                              for item in RESULTS
-                              for key in item
-                          })
-                      )
-                      writer.writeheader()
-                      writer.writerows(RESULTS)
+              if not answer:
+                  raise RuntimeError("Model returned an empty answer.")
 
-              report = {
-                  "repository": REPO,
-                  "selected": len(selected),
-                  "tested": tested,
-                  "exact_primary_matches": exact,
-                  "primary_mismatches": mismatches,
-                  "alternate_matches": alternate_matches,
-                  "errors": errors,
-                  "primary_match_percentage": (
-                      exact / tested * 100 if tested else None
-                  ),
-                  "by_type": dict(counts),
-                  "results": RESULTS,
-              }
+              result = "SUCCESS"
+              report("")
+              report("=" * 65)
+              report("NUMBAT ANSWER")
+              report("=" * 65)
+              report(answer)
+              report("=" * 65)
 
-              Path("numbat-forensics-full.json").write_text(
-                  json.dumps(
-                      report,
-                      indent=2,
-                      ensure_ascii=False
-                  ),
-                  encoding="utf-8"
-              )
+          except Exception as e:
+              result = "FAILED"
+              report("")
+              report("=" * 65)
+              report("INFERENCE FAILED")
+              report(f"{type(e).__name__}: {e}")
+              report("=" * 65)
+              traceback.print_exc()
 
-              log()
-              log("Reports saved.")
+          finally:
+              summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+              with summary.open("a", encoding="utf-8") as f:
+                  f.write("# Numbat Runner result\n\n")
+                  f.write(f"**Status:** `{result}`\n\n")
+                  f.write(f"**Model:** `{MODEL}`\n\n")
+                  f.write("## Execution log\n\n")
+                  f.write("```text\n")
+                  f.write("\n".join(details))
+                  f.write("\n```\n")
 
-              if errors:
-                  log(
-                      "WARNING: Some tensors could not be tested."
-                  )
-
-          if __name__ == "__main__":
-              main()
+          if result != "SUCCESS":
+              sys.exit(1)
           PY
 
-          python -u numbat_full_scan.py 2>&1 | tee numbat-run.log
-
-      - name: Upload forensic reports
+      - name: Cleanup downloaded files and cache
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: numbat-complete-forensic-report
-          path: |
-            numbat-forensics-full.log
-            numbat-forensics-full.csv
-            numbat-forensics-full.json
-            numbat-run.log
-          if-no-files-found: warn
-          retention-days: 30
+        run: |
+          echo "Starting cleanup..."
+          rm -rf "$HF_HOME"
+          rm -rf "${{ runner.temp }}/numbat-*"
+          echo "Temporary model files removed."
+          echo "GitHub Actions logs and run summary are preserved."
+
+      - name: Final status
+        if: always()
+        run: |
+          echo "Numbat Runner execution finished."
+          echo "Check the job logs and Summary tab."
