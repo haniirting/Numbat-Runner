@@ -42,9 +42,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install "huggingface_hub>=0.34.0"
 
-      - name: Download metadata and attempt real inference
+      - name: Run real Numbat text generation
         id: inference
-        continue-on-error: true
         run: |
           python - <<'PY'
           import os
@@ -58,60 +57,63 @@ jobs:
           MODEL = os.environ["MODEL_ID"]
           PROMPT = os.environ["USER_PROMPT"]
           CACHE = os.environ["HF_HOME"]
-
-          print("=" * 65)
-          print("NUMBAT RUNNER")
-          print("Model:", MODEL)
-          print("=" * 65)
+          TOKEN = os.getenv("HF_TOKEN") or None
 
           result = "NOT_STARTED"
           details = []
 
-          def report(text):
-              print(text, flush=True)
-              details.append(text)
+          def report(message):
+              print(message, flush=True)
+              details.append(message)
 
           try:
               disk = shutil.disk_usage(os.environ["RUNNER_TEMP"])
 
               memory = 0
-              try:
-                  with open("/proc/meminfo") as f:
-                      for line in f:
-                          if line.startswith("MemTotal:"):
-                              memory = int(line.split()[1]) * 1024
-                              break
-              except Exception:
-                  pass
+              with open("/proc/meminfo") as f:
+                  for line in f:
+                      if line.startswith("MemTotal:"):
+                          memory = int(line.split()[1]) * 1024
+                          break
 
+              report("=" * 65)
+              report("NUMBAT RUNNER")
+              report(f"Model: {MODEL}")
               report(f"Available disk: {disk.free / 1024**3:.2f} GB")
               report(f"Total RAM: {memory / 1024**3:.2f} GB")
+              report(f"HF token configured: {bool(TOKEN)}")
+              report("=" * 65)
+
+              if not TOKEN:
+                  raise RuntimeError("HF_TOKEN is missing.")
 
               report("Connecting to Hugging Face...")
-              api = HfApi(token=os.getenv("HF_TOKEN") or None)
+
+              api = HfApi(token=TOKEN)
               info = api.model_info(MODEL, files_metadata=True)
 
-              report("Hugging Face repository found.")
+              report("Repository found.")
               report(f"Revision: {info.sha}")
-
-              report("Downloading original model metadata...")
 
               config_path = hf_hub_download(
                   repo_id=MODEL,
                   filename="config.json",
-                  cache_dir=CACHE
+                  cache_dir=CACHE,
+                  token=TOKEN
               )
 
               index_path = hf_hub_download(
                   repo_id=MODEL,
                   filename="model.safetensors.index.json",
-                  cache_dir=CACHE
+                  cache_dir=CACHE,
+                  token=TOKEN
               )
 
               tokenizer_path = hf_hub_download(
                   repo_id=MODEL,
                   filename="tokenizer.json",
-                  cache_dir=CACHE
+                  cache_dir=CACHE,
+                  token=TOKEN
               )
 
               with open(config_path, encoding="utf-8") as f:
@@ -122,68 +124,54 @@ jobs:
 
               required = index.get("metadata", {}).get("total_size", 0)
 
-              report("Original configuration downloaded.")
-              report("Original tokenizer downloaded.")
-              report("Original tensor index downloaded.")
-              report(f"Model architecture: {config.get('architectures')}")
+              report(f"Architecture: {config.get('architectures')}")
               report(f"Model type: {config.get('model_type')}")
               report(f"Tensor mappings: {len(index.get('weight_map', {})):,}")
-              report(f"Declared weight size: {required:,} bytes")
-              report(f"Declared weight size: {required / 1024**4:.2f} TB")
-
-              if required:
-                  disk_ok = required < disk.free * 0.8
-                  memory_ok = required < memory * 0.65
-
-                  report(f"Full local download fits disk: {disk_ok}")
-                  report(f"Full local load fits RAM: {memory_ok}")
+              report(f"Weight size: {required / 1024**4:.2f} TB")
+              report("Metadata downloaded successfully.")
 
               report("")
-              report("ATTEMPTING REAL HUGGING FACE INFERENCE...")
-              report("Sending user prompt to the original model endpoint.")
+              report("ATTEMPTING REAL TEXT GENERATION...")
+              report("Using text_generation instead of chat_completion.")
 
               client = InferenceClient(
                   model=MODEL,
                   provider="auto",
-                  token=os.getenv("HF_TOKEN") or None,
-                  timeout=90
+                  token=TOKEN,
+                  timeout=180
               )
 
-              response = client.chat_completion(
-                  messages=[
-                      {
-                          "role": "user",
-                          "content": PROMPT
-                      }
-                  ],
-                  max_tokens=100,
-                  temperature=0.2
+              answer = client.text_generation(
+                  PROMPT,
+                  max_new_tokens=100,
+                  temperature=0.2,
+                  return_full_text=False
               )
 
-              answer = response.choices[0].message.content
-
-              if not answer:
+              if not answer or not answer.strip():
                   raise RuntimeError("Model returned an empty answer.")
 
               result = "SUCCESS"
+
               report("")
               report("=" * 65)
               report("NUMBAT ANSWER")
               report("=" * 65)
-              report(answer)
+              report(answer.strip())
               report("=" * 65)
 
-          except Exception as e:
+          except Exception as error:
               result = "FAILED"
               report("")
               report("=" * 65)
               report("INFERENCE FAILED")
-              report(f"{type(e).__name__}: {e}")
+              report(f"{type(error).__name__}: {error}")
               report("=" * 65)
               traceback.print_exc()
 
           finally:
               summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+
               with summary.open("a", encoding="utf-8") as f:
                   f.write("# Numbat Runner result\n\n")
                   f.write(f"**Status:** `{result}`\n\n")
@@ -203,11 +191,10 @@ jobs:
           echo "Starting cleanup..."
           rm -rf "$HF_HOME"
           rm -rf "${{ runner.temp }}/numbat-*"
-          echo "Temporary model files removed."
-          echo "GitHub Actions logs and run summary are preserved."
+          echo "Temporary files removed."
 
       - name: Final status
         if: always()
         run: |
           echo "Numbat Runner execution finished."
-          echo "Check the job logs and Summary tab."
+          echo "Check the Summary tab."
